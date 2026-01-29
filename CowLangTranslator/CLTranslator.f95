@@ -13,33 +13,43 @@ program CLtranslator
 
     character(len=10000) :: output_buffer = ""
 
+    ! ============ MAIN LOOP ============
     do
+        ! prompt
         write(*,'(A)',advance="no") ">>> "
         read(*,'(A)', end=100) line
         line = lstrip_ws(line)
         
+        ! strip user '>>>' if present
         if (index(line, ">>>") == 1) then
             line = lstrip_ws(line(4:))
         end if
 
-
+        ! prog start
         if (starts_with_keyword(line,"prog")) then
             current_prog_name = trim(extract_name_after_keyword(line,"prog"))
             in_prog = .true.
             cycle
         end if
 
+        ! prog end
         if (starts_with_keyword(line,"end prog")) then
             call handle_end_prog(line)
             exit
         end if
 
+        ! ignore lines outside program or empty lines
         if (.not. in_prog) cycle
         if (len_trim(line) == 0) cycle
 
+        ! parse line
         call parse_line(line)
     end do
 100 continue
+
+    ! pause at the very end so exe doesn’t close
+    print *,"Press ENTER to exit..."
+    read(*,'(A)') line
 
 contains
 
