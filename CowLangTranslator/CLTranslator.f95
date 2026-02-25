@@ -784,7 +784,7 @@ subroutine next_token_and_op(s, token, op)
                 end if
             end if
         else
-            if (in_squote .and. t(i:i) == '''') in_squote = .false.
+            if (in_squote .and. t(i:i) == "''") in_squote = .false.
             if (in_dquote .and. t(i:i) == '"')  in_dquote = .false.
         end if
         i = i + 1
