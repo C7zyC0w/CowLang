@@ -995,9 +995,13 @@ recursive subroutine eval_num_expr(expr, val, dp)
 
     if (index(ex, ' += ') > 0) then
         p = index(ex, ' += ')
-        call eval_num_expr(trim(ex(p+3:)),vr,dpr)
-        val = val + vr
-        dp = dpr
+        call eval_num_expr(trim(ex(p+4:)),vr,dpr)
+        idx = get_var_index(left)
+        read(vval(idx),*) vl
+        vl = vl + vr
+        write(vval(idx),*) vl
+        val = vl
+        dp = max(dp, dpr)
         return
     end if
 
