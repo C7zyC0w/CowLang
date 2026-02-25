@@ -993,6 +993,14 @@ recursive subroutine eval_num_expr(expr, val, dp)
         return
     end if
 
+    if (index(ex, ' += ') > 0) then
+        p = index(ex, ' += ')
+        call eval_num_expr(trim(ex(p+3:)),vr,dpr)
+        val = val + vr
+        dp = dpr
+        return
+    end if
+
     call get_val_dp(ex,val,dp)
 end subroutine
 
