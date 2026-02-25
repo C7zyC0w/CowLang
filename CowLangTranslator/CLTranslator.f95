@@ -845,7 +845,7 @@ function resolve_value(tok) result(res)
     ! string literal
     if (len_trim(ttrim) >= 2) then
         if ( (ttrim(1:1) == '"' .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == '"') .or. &
-             (ttrim(1:1) == '''' .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == '''') ) then
+             (ttrim(1:1) == "''" .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == "''") ) then
             res = ttrim(2:len_trim(ttrim)-1)
             return
         end if
