@@ -1,0 +1,3 @@
+prog test
+  print, "Hello, World!"
+end prog test

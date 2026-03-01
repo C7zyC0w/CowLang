@@ -17,14 +17,18 @@ import textwrap
 INDENT = "  "  # 2 spaces for auto-indentation and block bodies
 
 # === CONFIG ===
-COWLANG_EXE = r"C:\Users\kaise\Documents\GitHub\CowLang\CowLangTranslator\CLT 0.2.1.exe"
+COWLANG_EXE = r"/home/c0w/Documents/CowLang-main/CowLangTranslator/CLT-Linux_0.2.1.exe"
 COWLANG_DIR = os.path.dirname(COWLANG_EXE)
 
+# =========================================
 # Explicit R & Python paths (user-provided)
-RSCRIPT_EXE = r"C:\Program Files\R\R-4.5.2\bin\x64\Rscript.exe"
+# =========================================
+
+# R.studio
+RSCRIPT_EXE = r"/mnt/windows/Program Files/R/R-4.5.2/bin/x64/Rscript.exe"
 
 # If this folder does not contain python.exe, we'll fall back to sys.executable
-PYTHON_EXE_DIR = r"C:\Users\kaise\AppData\Local\Python\pythoncore-3.14-64"
+PYTHON_EXE_DIR = r"/usr/bin/python3.14"
 PYTHON_EXE = os.path.join(PYTHON_EXE_DIR, "python.exe")
 
 # === COWLANG SYNTAX ===
@@ -40,7 +44,7 @@ KEYWORDS = [
     "for", "do", "dowhile", "while",
 
     # defs (future)
-    "def", "subr", "class",
+    "def", "subr", "class", "func"
 
     # types / variables
     "string", "str",

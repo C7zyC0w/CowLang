@@ -1,0 +1,6 @@
+prog test
+  int :: num = 5
+  int :: num1 = 3
+  int :: res = num + num1
+  print, res num1
+ end prog test
