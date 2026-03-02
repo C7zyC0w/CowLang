@@ -84,8 +84,19 @@ program CLtranslator
         end if
 
         if (starts_with_keyword(line,'end prog')) then
-            call handle_end_prog()
-            exit
+            character(len=64) :: given_name
+            given_name = trim(lstrip_ws(line(len_trim('end prog')+1:)))
+            if (len_trim(given_name) == 0) then
+                call handle_end_prog()
+                exit
+            else
+                if (to_lower(given_name) == to_lower(trim(current_prog_name))) then
+                    call handle_end_prog(given_name)
+                    exit
+                else
+                    call push_line(outbuf, outcount, 'Error: end prog name "'//trim(given_name)//'" does not match current program "'//trim(current_prog_name)//'". Use "end prog" to omit name.')
+                end if
+            end if
         end if
 
         if (.not. in_prog) cycle
@@ -95,7 +106,6 @@ program CLtranslator
     end do
 
 100 continue
-    ! If EOF inside program, flush once
     if (in_prog) then
         call handle_end_prog()
     end if
@@ -1103,12 +1113,22 @@ subroutine get_val_dp(expr, val, dp)
 end subroutine
 
 ! ================= END PROGRAM =================
-subroutine handle_end_prog()
-    print *,'Program ',trim(current_prog_name),' ended.'
+subroutine handle_end_prog(given_name)
+    character(len=*), intent(in), optional :: given_name
+    character(len=64) :: pname
+    if (present(given_name) .and. len_trim(given_name) > 0) then
+        pname = trim(given_name)
+    else
+        pname = ''
+    end if
+    if (len_trim(pname) > 0) then
+        print *,'Program ',pname,' ended.'
+    else
+        print *,'Program ended.'
+    end if
     print *,'Output buffer:'
     call flush_output(outbuf, outcount)
 
-    ! Reset state for next program (REPL stays)
     vcount  = 0
     outcount= 0
     if_sp   = 0
