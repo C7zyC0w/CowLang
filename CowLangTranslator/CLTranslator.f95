@@ -21,6 +21,7 @@ program CLtranslator
     character(len=300) :: line
     logical :: in_prog
     character(len=64) :: current_prog_name
+    character(len=64) :: given_name
 
     ! ---- Output line buffer (used when DIRECT_PRINT=.false.) ----
     character(len=1000) :: outbuf(MAXOUT)
@@ -84,7 +85,6 @@ program CLtranslator
         end if
 
         if (starts_with_keyword(line,'end prog')) then
-            character(len=64) :: given_name
             given_name = trim(lstrip_ws(line(len_trim('end prog')+1:)))
             if (len_trim(given_name) == 0) then
                 call handle_end_prog()
@@ -962,6 +962,8 @@ recursive subroutine eval_num_expr(expr, val, dp)
     integer :: p
     real :: vl, vr
     integer :: dpl, dpr
+    integer :: idx
+    character(len=200) :: left
 
     dp = 0
     val = 0.0
@@ -1006,7 +1008,14 @@ recursive subroutine eval_num_expr(expr, val, dp)
     if (index(ex, ' += ') > 0) then
         p = index(ex, ' += ')
         call eval_num_expr(trim(ex(p+4:)),vr,dpr)
+        left = trim(ex(:p-1))
         idx = get_var_index(left)
+        if (idx <= 0) then
+            call push_line(outbuf, outcount, 'Error: variable '//trim(left)//' not found')
+            val = 0.0
+            dp = 0
+            return
+        end if
         read(vval(idx),*) vl
         vl = vl + vr
         write(vval(idx),*) vl
