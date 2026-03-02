@@ -22,6 +22,7 @@ program CLtranslator
     logical :: in_prog
     character(len=64) :: current_prog_name
     character(len=64) :: given_name
+    character(len=300) :: errmsg
 
     ! ---- Output line buffer (used when DIRECT_PRINT=.false.) ----
     character(len=1000) :: outbuf(MAXOUT)
@@ -94,7 +95,9 @@ program CLtranslator
                     call handle_end_prog(given_name)
                     exit
                 else
-                    call push_line(outbuf, outcount, 'Error: end prog name "'//trim(given_name)//'" does not match current program "'//trim(current_prog_name)//'". Use "end prog" to omit name.')
+                    errmsg = 'Error: end prog name "'//trim(given_name)//'" does not match '// &
+                             'current program "'//trim(current_prog_name)//'".'
+                    call push_line(outbuf, outcount, trim(errmsg)//' Use "end prog" to omit name.')
                 end if
             end if
         end if
