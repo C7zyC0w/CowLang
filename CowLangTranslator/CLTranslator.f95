@@ -296,13 +296,25 @@ function int2s(i) result(s)
 end function
 
 ! ================= PARSER =================
-subroutine parse_line(cmd)
+recursive subroutine parse_line(cmd)
     character(len=*), intent(in) :: cmd
-    character(len=300) :: l, rest
+    character(len=300) :: l, rest, inner, cond
+    integer :: pwhile
 
     l = lstrip_ws(normalize_html(cmd))
 
-    ! If capturing a loop body
+    if (starts_with_keyword(l,'do')) then
+        pwhile = index(to_lower(l),' while ')
+        if (pwhile > 0 .and. loop_sp == 0) then
+            inner = trim(l(4:pwhile-1))
+            cond  = strip_ctrl_tail(l(pwhile+7:))
+            if (len_trim(inner) > 0) then
+                call exec_single_do_while(inner, cond)
+            end if
+            return
+        end if
+    end if
+
     if (loop_sp > 0) then
         if (starts_with_keyword(l,'for') .or. &
             starts_with_keyword(l,'while') .or. &
@@ -331,7 +343,6 @@ subroutine parse_line(cmd)
         return
     end if
 
-    ! IF blocks (top-level gating only; inside body they are captured as text)
     if (starts_with_keyword(l,'if')) then
         call handle_if(l); return
     end if
@@ -349,7 +360,6 @@ subroutine parse_line(cmd)
         if (.not. if_active(if_sp)) return
     end if
 
-    ! LOOP starts
     if (starts_with_keyword(l,'for') .or. &
         starts_with_keyword(l,'while') .or. &
         starts_with_keyword(l,'dowhile') .or. &
@@ -358,26 +368,22 @@ subroutine parse_line(cmd)
         return
     end if
 
-    ! stray end ... (ignore)
     if (starts_with_keyword(l,'end for') .or. &
         starts_with_keyword(l,'end while') .or. &
         starts_with_keyword(l,'end do')) then
         return
     end if
 
-    ! DECLARATION
     if (index(l,'::')>0 .and. index(l,'=')>0) then
         call store_variable(l)
         return
     end if
 
-    ! ASSIGNMENT (no '::', has '=' but not '==')
     if (index(l,'=')>0 .and. index(l,'==')==0) then
         call handle_assignment(l)
         return
     end if
 
-    ! PRINT (support "print expr" and "print, expr")
     if (starts_with_keyword(l,'print')) then
         rest = lstrip_ws(l(6:))
         if (len_trim(rest) > 0) then
@@ -388,6 +394,33 @@ subroutine parse_line(cmd)
         call do_print(rest)
         return
     end if
+end subroutine
+
+subroutine execute_stmt_list(list)
+    character(len=*), intent(in) :: list
+    character(len=300) :: s, part
+    integer :: p
+    s = trim(list)
+    do while (len_trim(s) > 0)
+        p = index(s, ';')
+        if (p > 0) then
+            part = trim(s(:p-1))
+            if (len_trim(part) > 0) call parse_line(part)
+            s = lstrip_ws(s(p+1:))
+        else
+            if (len_trim(s) > 0) call parse_line(s)
+            exit
+        end if
+    end do
+end subroutine
+
+subroutine exec_single_do_while(stmt, condition)
+    character(len=*), intent(in) :: stmt, condition
+    call execute_stmt_list(stmt)
+    do
+        if (.not. eval_bool_expr(condition)) exit
+        call execute_stmt_list(stmt)
+    end do
 end subroutine
 
 subroutine append_to_current_body(s)
