@@ -39,6 +39,7 @@ program CLtranslator
         integer           :: body_count
         character(len=300):: body(MAXBODY)
         integer           :: nest      ! nesting depth while capturing body
+        logical           :: do_awaiting_while  ! true when inside "do...while" before "while" seen
     end type
 
     type(loop_struct) :: loops(MAXLOOP)
@@ -291,10 +292,21 @@ subroutine parse_line(cmd)
 
     ! If capturing a loop body
     if (loop_sp > 0) then
+        ! If we are in a do-while and haven't seen "while" yet,
+        ! check if this line is "while <cond>" (the closing condition line)
+        if (loops(loop_sp)%do_awaiting_while .and. loops(loop_sp)%nest == 0) then
+            if (starts_with_keyword(l,'while')) then
+                loops(loop_sp)%cond = trim(lstrip_ws(l(6:)))
+                loops(loop_sp)%do_awaiting_while = .false.
+                if (TRACE) call dbg('DOWHILE got cond: ['//trim(loops(loop_sp)%cond)//']')
+                ! Now wait for "end do"
+                return
+            end if
+        end if
+
         if (starts_with_keyword(l,'for') .or. &
             starts_with_keyword(l,'while') .or. &
-            starts_with_keyword(l,'dowhile') .or. &
-            starts_with_keyword(l,'do while')) then
+            (trim(to_lower(l)) == 'do')) then
             loops(loop_sp)%nest = loops(loop_sp)%nest + 1
             call append_to_current_body(l)
             return
@@ -339,8 +351,7 @@ subroutine parse_line(cmd)
     ! LOOP starts
     if (starts_with_keyword(l,'for') .or. &
         starts_with_keyword(l,'while') .or. &
-        starts_with_keyword(l,'dowhile') .or. &
-        starts_with_keyword(l,'do while')) then
+        (trim(to_lower(l)) == 'do')) then
         call handle_loop_start(l)
         return
     end if
@@ -433,7 +444,7 @@ end subroutine
 ! ================= LOOP CAPTURE + EXECUTE =================
 subroutine handle_loop_start(l)
     character(len=*), intent(in) :: l
-    integer :: p1,p2,p3
+    integer :: p1,p2,p3,dpdum
     character(len=32) :: varname
     character(len=200) :: tmpstr_start, tmpstr_end, tmpstr_step, rest
     real :: startv, endv, stepv
@@ -455,20 +466,33 @@ subroutine handle_loop_start(l)
     loops(loop_sp)%start = 0.0
     loops(loop_sp)%endv  = 0.0
     loops(loop_sp)%step  = 1.0
+    loops(loop_sp)%do_awaiting_while = .false.
 
     if (starts_with_keyword(low,'for')) then
         loops(loop_sp)%ltype = 'for'
         p1 = index(low,'range')
-        p2 = index(low,'to')
-        p3 = index(low,'step')
-        varname = trim(l(5:p1-1))
+        p2 = index(low,' to ')
+        p3 = index(low,' step ')
 
-        tmpstr_start = trim(l(p1+5:p2-1)); read(tmpstr_start,*) startv
+        if (p1 <= 0 .or. p2 <= 0) then
+            call push_line(outbuf, outcount, 'Error: for loop syntax: for VAR range X to Y [step Z]')
+            loop_sp = loop_sp - 1
+            return
+        end if
+
+        varname = trim(lstrip_ws(l(5:p1-1)))
+
+        tmpstr_start = trim(lstrip_ws(l(p1+5:p2-1)))
+        call eval_num_expr(tmpstr_start, startv, dpdum)
+
         if (p3 > 0) then
-            tmpstr_end  = trim(l(p2+2:p3-1)); read(tmpstr_end,*)  endv
-            tmpstr_step = trim(l(p3+4:));     read(tmpstr_step,*) stepv
+            tmpstr_end  = trim(lstrip_ws(l(p2+4:p3-1)))
+            tmpstr_step = trim(lstrip_ws(l(p3+6:)))
+            call eval_num_expr(tmpstr_end,  endv,  dpdum)
+            call eval_num_expr(tmpstr_step, stepv, dpdum)
         else
-            tmpstr_end  = trim(l(p2+2:));     read(tmpstr_end,*)  endv
+            tmpstr_end = trim(lstrip_ws(l(p2+4:)))
+            call eval_num_expr(tmpstr_end, endv, dpdum)
             stepv = 1.0
         end if
 
@@ -487,10 +511,11 @@ subroutine handle_loop_start(l)
         loops(loop_sp)%cond = rest
         if (TRACE) call dbg('WHILE cond: ['//trim(rest)//']')
 
-    else if (starts_with_keyword(low,'dowhile') .or. starts_with_keyword(low,'do while')) then
+    else if (trim(low) == 'do') then
+        ! "do" alone starts a do-while body capture; "while <cond>" closes it
         loops(loop_sp)%ltype = 'dowhile'
-        loops(loop_sp)%cond = strip_ctrl_tail(l(index(low,'while')+5:))
-        if (TRACE) call dbg('DOWHILE cond: ['//trim(loops(loop_sp)%cond)//']')
+        loops(loop_sp)%do_awaiting_while = .true.
+        if (TRACE) call dbg('DO (awaiting while <cond>)')
 
     else
         loops(loop_sp)%ltype = 'unknown'
@@ -527,7 +552,7 @@ subroutine execute_block(body, count)
     character(len=300), intent(in) :: body(:)
     integer,            intent(in) :: count
 
-    integer :: j, k, start_idx, nest
+    integer :: j, k, start_idx, nest, dpdum
     character(len=300) :: s, low
     type(loop_struct)  :: inner
     integer :: p1, p2, p3
@@ -542,8 +567,7 @@ subroutine execute_block(body, count)
         ! Nested loop inside body
         if (starts_with_keyword(low,'for') .or. &
             starts_with_keyword(low,'while') .or. &
-            starts_with_keyword(low,'dowhile') .or. &
-            starts_with_keyword(low,'do while')) then
+            (trim(low) == 'do')) then
 
             inner%body_count = 0
             inner%nest = 0
@@ -552,25 +576,26 @@ subroutine execute_block(body, count)
             inner%start = 0.0
             inner%endv  = 0.0
             inner%step  = 1.0
+            inner%do_awaiting_while = .false.
 
             if (starts_with_keyword(low,'for')) then
                 inner%ltype = 'for'
-                p1 = index(low,'range'); p2 = index(low,'to'); p3 = index(low,'step')
-                inner%var = trim(s(5:p1-1))
-                a = trim(s(p1+5:p2-1)); read(a,*) inner%start
+                p1 = index(low,'range'); p2 = index(low,' to '); p3 = index(low,' step ')
+                inner%var = trim(lstrip_ws(s(5:p1-1)))
+                a = trim(lstrip_ws(s(p1+5:p2-1))); call eval_num_expr(a, inner%start, dpdum)
                 if (p3 > 0) then
-                    b = trim(s(p2+2:p3-1)); read(b,*) inner%endv
-                    c = trim(s(p3+4:));      read(c,*) inner%step
+                    b = trim(lstrip_ws(s(p2+4:p3-1))); call eval_num_expr(b, inner%endv, dpdum)
+                    c = trim(lstrip_ws(s(p3+6:)));      call eval_num_expr(c, inner%step, dpdum)
                 else
-                    b = trim(s(p2+2:));      read(b,*) inner%endv
+                    b = trim(lstrip_ws(s(p2+4:)));      call eval_num_expr(b, inner%endv, dpdum)
                     inner%step = 1.0
                 end if
             else if (starts_with_keyword(low,'while')) then
                 inner%ltype = 'while'
                 inner%cond = strip_ctrl_tail(s(6:))
-            else
+            else if (trim(low) == 'do') then
                 inner%ltype = 'dowhile'
-                inner%cond = strip_ctrl_tail(s(index(low,'while')+5:))
+                inner%do_awaiting_while = .true.
             end if
 
             start_idx = j + 1
@@ -578,8 +603,7 @@ subroutine execute_block(body, count)
             do k = start_idx, count
                 if (starts_with_keyword(to_lower(lstrip_ws(body(k))),'for') .or. &
                     starts_with_keyword(to_lower(lstrip_ws(body(k))),'while') .or. &
-                    starts_with_keyword(to_lower(lstrip_ws(body(k))),'dowhile') .or. &
-                    starts_with_keyword(to_lower(lstrip_ws(body(k))),'do while')) then
+                    (trim(to_lower(lstrip_ws(body(k)))) == 'do')) then
                     nest = nest + 1
                     if (inner%body_count < MAXBODY) then
                         inner%body_count = inner%body_count + 1
@@ -597,6 +621,13 @@ subroutine execute_block(body, count)
                             inner%body(inner%body_count) = body(k)
                         end if
                     end if
+                else if (inner%do_awaiting_while .and. nest == 0 .and. &
+                         starts_with_keyword(to_lower(lstrip_ws(body(k))),'while')) then
+                    ! This is the "while <cond>" line for the do-while
+                    a = lstrip_ws(body(k))
+                    inner%cond = trim(lstrip_ws(a(6:)))
+                    inner%do_awaiting_while = .false.
+                    ! Don't add to body; next line should be "end do"
                 else
                     if (inner%body_count < MAXBODY) then
                         inner%body_count = inner%body_count + 1
@@ -993,17 +1024,8 @@ recursive subroutine eval_num_expr(expr, val, dp)
         return
     end if
 
-    if (index(ex, ' += ') > 0) then
-        p = index(ex, ' += ')
-        call eval_num_expr(trim(ex(p+4:)),vr,dpr)
-        idx = get_var_index(left)
-        read(vval(idx),*) vl
-        vl = vl + vr
-        write(vval(idx),*) vl
-        val = vl
-        dp = max(dp, dpr)
-        return
-    end if
+    ! += is handled at the assignment level, not inside numeric expression eval
+    ! so we skip it here and fall through to get_val_dp
 
     call get_val_dp(ex,val,dp)
 end subroutine
