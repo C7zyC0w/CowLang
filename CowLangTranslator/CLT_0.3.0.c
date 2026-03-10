@@ -1,6 +1,5 @@
 // cowlang_full.c
 // Full single-file native port of the provided JS runtime and CLTranslator.
-// - SDL2 used for graphics (stars + comets).
 // - A CowLang interpreter implementing a large subset of the JS version.
 // - File writing (writefile) supported (writes to disk).
 //
