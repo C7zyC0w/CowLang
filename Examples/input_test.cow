@@ -1,0 +1,10 @@
+prog test
+  read str :: f_name, "Please enter your first name."
+  read str :: s_name, "Please enter your last name."
+  read int :: dob, "Please enter your date of birth as dd/mm/yy."
+  
+  str :: name = f_name & s_name & dob
+  
+  print, name
+  
+end prog

@@ -62,14 +62,16 @@ program CLtranslator
 
     ! ================= MAIN REPL LOOP =================
     do
+        ! Prompts go to stderr (unit 0) so they never mix with program output
+        ! on stdout. Interactive terminal users still see them; pipe/IDE users don't.
         depth = loop_sp + if_sp
         if (depth > 0) then
-            write(*,'(A)',advance='no') PROMPT_CONT
+            write(0,'(A)',advance='no') PROMPT_CONT
             do i=1, depth-1
-                write(*,'(A)',advance='no') '    '
+                write(0,'(A)',advance='no') '    '
             end do
         else
-            write(*,'(A)',advance='no') PROMPT_MAIN
+            write(0,'(A)',advance='no') PROMPT_MAIN
         end if
 
         read(*,'(A)', end=100) line
@@ -405,6 +407,16 @@ recursive subroutine parse_line(cmd)
         call do_print(rest)
         return
     end if
+
+    if (starts_with_keyword(l,'read')) then
+        rest = lstrip_ws(l(5:))
+        ! strip optional leading comma  (e.g. "read, "prompt"")
+        if (len_trim(rest) > 0) then
+            if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
+        end if
+        call do_read(rest)
+        return
+    end if
 end subroutine
 
 subroutine execute_stmt_list(list)
@@ -714,6 +726,17 @@ subroutine execute_block(body, count)
             cycle
         end if
 
+        ! read
+        if (starts_with_keyword(s,'read')) then
+            rest = lstrip_ws(s(5:))
+            if (len_trim(rest) > 0) then
+                if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
+            end if
+            call do_read(rest)
+            j = j + 1
+            cycle
+        end if
+
         j = j + 1
     end do
 end subroutine
@@ -733,12 +756,27 @@ subroutine handle_assignment(line)
     name = trim(lstrip_ws(line(:p-1)))
     expr = trim(lstrip_ws(line(p+1:)))
 
+    ! string literal
     if (len_trim(expr) >= 1) then
         if (expr(1:1) == '"') then
-            sval = strip_quotes(expr)
-            call set_or_create_var(name, 'str', sval)
+            ! still check for concat: "hello" & varname
+            if (expr_has_str_op(expr)) then
+                sval = eval_str_expr(expr)
+                call set_or_create_var(name, 'str', trim(sval))
+            else
+                sval = strip_quotes(expr)
+                call set_or_create_var(name, 'str', sval)
+            end if
             return
         end if
+    end if
+
+    ! variable or expression containing & or + for string concat
+    if (expr_has_str_op(expr)) then
+        sval = eval_str_expr(expr)
+        ! keep the existing type if variable already declared, else str
+        call set_or_create_var(name, 'str', trim(sval))
+        return
     end if
 
     call eval_num_expr(expr, val, dp)
@@ -776,20 +814,40 @@ end subroutine
 subroutine store_variable(cmd)
     character(len=*), intent(in) :: cmd
     character(len=32)  :: name, typ
-    character(len=200) :: val
-    integer :: p2,p3
+    character(len=200) :: val, expr_str
+    integer :: p2, p3
+    real :: numval
+    integer :: dp
 
     p2 = index(cmd,'::')
     p3 = index(cmd,'=')
 
     read(cmd(:p2-1),*) typ
-    name = trim(lstrip_ws(cmd(p2+2:p3-1)))
-    val  = trim(lstrip_ws(cmd(p3+1:)))
+    typ      = to_lower(trim(typ))
+    name     = trim(lstrip_ws(cmd(p2+2:p3-1)))
+    expr_str = trim(lstrip_ws(cmd(p3+1:)))
 
-    vcount = vcount + 1
-    vname(vcount) = name
-    vtype(vcount) = to_lower(typ)
-    vval(vcount)  = strip_quotes(val)
+    ! If the expression contains & or + (outside quotes) treat as str concat
+    if (expr_has_str_op(expr_str)) then
+        val = eval_str_expr(expr_str)
+        if (vcount < MAXV) then
+            vcount = vcount + 1
+            vname(vcount) = trim(name)
+            vtype(vcount) = typ
+            vval(vcount)  = trim(val)
+        end if
+        return
+    end if
+
+    ! plain literal or numeric
+    val = trim(strip_quotes(expr_str))
+
+    if (vcount < MAXV) then
+        vcount = vcount + 1
+        vname(vcount) = trim(name)
+        vtype(vcount) = typ
+        vval(vcount)  = val
+    end if
 end subroutine
 
 subroutine set_variable(name, typ, val)
@@ -1072,29 +1130,8 @@ recursive subroutine eval_num_expr(expr, val, dp)
         return
     end if
 
-<<<<<<< HEAD
     ! += is handled at the assignment level, not inside numeric expression eval
     ! so we skip it here and fall through to get_val_dp
-=======
-    if (index(ex, ' += ') > 0) then
-        p = index(ex, ' += ')
-        call eval_num_expr(trim(ex(p+4:)),vr,dpr)
-        left = trim(ex(:p-1))
-        idx = get_var_index(left)
-        if (idx <= 0) then
-            call push_line(outbuf, outcount, 'Error: variable '//trim(left)//' not found')
-            val = 0.0
-            dp = 0
-            return
-        end if
-        read(vval(idx),*) vl
-        vl = vl + vr
-        write(vval(idx),*) vl
-        val = vl
-        dp = max(dp, dpr)
-        return
-    end if
->>>>>>> 521d9d61c24255c412b0f9c3b0500c46e958336b
 
     call get_val_dp(ex,val,dp)
 end subroutine
@@ -1193,21 +1230,262 @@ subroutine get_val_dp(expr, val, dp)
 100 continue
 end subroutine
 
+! ================= STRING EXPRESSION EVALUATOR =================
+! eval_str_expr: resolves a & / + concatenation expression to a string.
+!   &  adds a space between values  (like Python's join-with-space)
+!   +  concatenates without a space
+! Any token that is a known variable is resolved to its value.
+! Numeric variables are coerced to their display string.
+! String literals (single or double quoted) are unquoted.
+!
+! expr_has_str_op: returns .true. if the expression contains a bare
+! & or + that is outside quotes — meaning it is a string concat op.
+! This lets handle_assignment / store_variable decide which path to use.
+
+logical function expr_has_str_op(s)
+    character(len=*), intent(in) :: s
+    integer :: i, n
+    logical :: in_sq, in_dq
+    in_sq = .false.; in_dq = .false.
+    n = len_trim(s)
+    expr_has_str_op = .false.
+    do i = 1, n
+        if (.not. in_sq .and. .not. in_dq) then
+            if (s(i:i) == "'")  in_sq = .true.
+            if (s(i:i) == '"')  in_dq = .true.
+            if (s(i:i) == '&' .or. s(i:i) == '+') then
+                ! Make sure it's not == or +=  (those are two-char ops)
+                if (i+1 <= n) then
+                    if (s(i+1:i+1) == '=' ) return  ! skip += or ==
+                end if
+                ! Also skip numeric-only contexts: if there are NO variable
+                ! names in the expression, & and + are numeric ops, not string.
+                ! We rely on the caller (handle_assignment) to try numeric first
+                ! when no variables are found. Here we just say "yes, op present".
+                expr_has_str_op = .true.
+                return
+            end if
+        else
+            if (in_sq .and. s(i:i) == "'")  in_sq = .false.
+            if (in_dq .and. s(i:i) == '"')  in_dq = .false.
+        end if
+    end do
+end function
+
+function eval_str_expr(expr) result(res)
+    character(len=*),   intent(in) :: expr
+    character(len=1000) :: res
+    character(len=400)  :: rest, token_s
+    character(len=200)  :: piece
+    character           :: op, last_op
+    logical             :: first
+
+    rest     = trim(lstrip_ws(normalize_html(expr)))
+    res      = ''
+    first    = .true.
+    last_op  = char(0)
+
+    do
+        call next_token_and_op(rest, token_s, op)
+        if (len_trim(token_s) == 0 .and. op == char(0)) exit
+
+        ! resolve the token: literal or variable
+        piece = trim(resolve_value(token_s))
+
+        if (.not. first) then
+            if (last_op == '&') then
+                ! & inserts a space between values
+                res = trim(res)//' '
+            end if
+            ! + just concatenates (no space)
+        end if
+
+        res   = trim(res)//trim(piece)
+        first = .false.
+
+        if (op == char(0)) exit
+        last_op = op
+    end do
+end function
+
+! ================= READ =================
+! Supported syntaxes:
+!   read varname
+!   read varname, "prompt"
+!   read, "prompt"                      (prompt only, no capture)
+!   read type :: varname                (declare then read)
+!   read type :: varname, "prompt"      (declare then read with prompt)
+!
+! The prompt (if any) is printed to stdout immediately (no newline),
+! then the user's input is read on the next line.
+! User input is NOT echoed back or prefixed with ">>>".
+subroutine do_read(rest)
+    character(len=*), intent(in) :: rest
+    character(len=300) :: r, varname, prompt_str, typ, decl_part, after_decl
+    character(len=200) :: input_line
+    integer :: comma_pos, dcolon_pos, idx
+    logical :: has_prompt, is_decl
+
+    r          = trim(lstrip_ws(rest))
+    prompt_str = ''
+    varname    = ''
+    typ        = ''
+    has_prompt = .false.
+    is_decl    = .false.
+
+    ! ── detect "type :: varname" declaration form ─────────────────────────────
+    dcolon_pos = index(r, '::')
+    if (dcolon_pos > 0) then
+        is_decl    = .true.
+        decl_part  = trim(lstrip_ws(r(:dcolon_pos-1)))  ! e.g. "int"
+        after_decl = trim(lstrip_ws(r(dcolon_pos+2:)))  ! e.g. 'varname, "prompt"'
+        read(decl_part, '(A)') typ
+        typ = to_lower(trim(typ))
+        ! normalise type aliases to match vtype conventions
+        select case (typ)
+        case ('integer');    typ = 'int'
+        case ('floatation'); typ = 'float'
+        case ('string');     typ = 'str'
+        case ('booleon');    typ = 'bool'
+        case ('character');  typ = 'char'
+        end select
+        r = after_decl
+    end if
+
+    ! ── split off optional prompt after comma ─────────────────────────────────
+    ! We look for the LAST comma that is outside quotes to be safe,
+    ! but a simple first-comma-outside-quotes is fine for read syntax.
+    comma_pos = 0
+    call find_comma_outside_quotes(r, comma_pos)
+
+    if (comma_pos > 0) then
+        varname    = trim(lstrip_ws(r(:comma_pos-1)))
+        prompt_str = trim(lstrip_ws(r(comma_pos+1:)))
+        has_prompt = .true.
+    else
+        varname = trim(lstrip_ws(r))
+    end if
+
+    ! strip quotes from prompt if present
+    if (has_prompt) then
+        prompt_str = strip_any_quotes(prompt_str)
+    end if
+
+    ! ── flush buffered output BEFORE the prompt so it appears in order ────────
+    call flush_output(outbuf, outcount)
+
+    ! ── print prompt to stdout (no newline) ───────────────────────────────────
+    if (has_prompt .and. len_trim(prompt_str) > 0) then
+        write(*,'(A)') trim(prompt_str)
+    end if
+
+    ! ── if varname is empty (bare "read, prompt") just return after prompt ────
+    if (len_trim(varname) == 0) return
+
+    ! ── declare variable if this is a declaration form ────────────────────────
+    if (is_decl) then
+        idx = get_var_index(varname)
+        if (idx <= 0) then
+            ! create with empty value
+            if (vcount < MAXV) then
+                vcount = vcount + 1
+                vname(vcount) = trim(varname)
+                vtype(vcount) = trim(typ)
+                vval(vcount)  = ''
+                idx = vcount
+            else
+                call push_line(outbuf, outcount, 'Error: variable table full')
+                return
+            end if
+        else
+            vtype(idx) = trim(typ)
+        end if
+    end if
+
+    ! ── read a line from stdin ────────────────────────────────────────────────
+    read(*,'(A)', end=200) input_line
+    input_line = trim(lstrip_ws(input_line))
+    goto 201
+200 input_line = ''
+201 continue
+
+    ! ── store into variable ───────────────────────────────────────────────────
+    idx = get_var_index(varname)
+    if (idx <= 0) then
+        ! variable not declared — auto-create as str
+        if (vcount < MAXV) then
+            vcount = vcount + 1
+            vname(vcount) = trim(varname)
+            vtype(vcount) = 'str'
+            vval(vcount)  = trim(input_line)
+        else
+            call push_line(outbuf, outcount, 'Error: variable table full')
+        end if
+        return
+    end if
+
+    ! coerce to declared type
+    select case (to_lower(trim(vtype(idx))))
+    case ('int','integer')
+        ! validate it looks numeric; store as-is for int2s later
+        vval(idx) = trim(input_line)
+    case ('float','floatation','real')
+        vval(idx) = trim(input_line)
+    case ('bool','booleon')
+        select case (to_lower(trim(input_line)))
+        case ('true','yes','1','t'); vval(idx) = 'true'
+        case default;                vval(idx) = 'false'
+        end select
+    case ('char','character')
+        if (len_trim(input_line) >= 1) then
+            vval(idx) = input_line(1:1)
+        else
+            vval(idx) = ''
+        end if
+    case default   ! str / string
+        vval(idx) = trim(input_line)
+    end select
+end subroutine
+
+! Helper: find position of first comma that is outside single or double quotes
+subroutine find_comma_outside_quotes(s, pos)
+    character(len=*), intent(in)  :: s
+    integer,          intent(out) :: pos
+    integer :: i, n
+    logical :: in_sq, in_dq
+    pos = 0; in_sq = .false.; in_dq = .false.
+    n = len_trim(s)
+    do i = 1, n
+        if (.not. in_sq .and. .not. in_dq) then
+            if (s(i:i) == "'")  in_sq = .true.
+            if (s(i:i) == '"')  in_dq = .true.
+            if (s(i:i) == ',')  then; pos = i; return; end if
+        else
+            if (in_sq .and. s(i:i) == "'")  in_sq = .false.
+            if (in_dq .and. s(i:i) == '"')  in_dq = .false.
+        end if
+    end do
+end subroutine
+
+! Helper: strip surrounding single or double quotes from a string
+function strip_any_quotes(s) result(o)
+    character(len=*),   intent(in) :: s
+    character(len=200) :: o
+    integer :: n
+    o = trim(s)
+    n = len_trim(o)
+    if (n >= 2) then
+        if ((o(1:1) == '"'  .and. o(n:n) == '"') .or. &
+            (o(1:1) == "'"  .and. o(n:n) == "'")) then
+            o = o(2:n-1)
+        end if
+    end if
+end function
+
 ! ================= END PROGRAM =================
 subroutine handle_end_prog(given_name)
     character(len=*), intent(in), optional :: given_name
-    character(len=64) :: pname
-    if (present(given_name) .and. len_trim(given_name) > 0) then
-        pname = trim(given_name)
-    else
-        pname = ''
-    end if
-    if (len_trim(pname) > 0) then
-        print *,'Program ',pname,' ended.'
-    else
-        print *,'Program ended.'
-    end if
-    print *,'Output buffer:'
+    ! Flush buffered program output to stdout — no extra noise lines
     call flush_output(outbuf, outcount)
 
     vcount  = 0
