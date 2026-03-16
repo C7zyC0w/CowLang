@@ -21,6 +21,8 @@ program CLtranslator
     character(len=300) :: line
     logical :: in_prog
     character(len=64) :: current_prog_name
+    character(len=64) :: given_name
+    character(len=300) :: errmsg
 
     ! ---- Output line buffer (used when DIRECT_PRINT=.false.) ----
     character(len=1000) :: outbuf(MAXOUT)
@@ -85,8 +87,20 @@ program CLtranslator
         end if
 
         if (starts_with_keyword(line,'end prog')) then
-            call handle_end_prog()
-            exit
+            given_name = trim(lstrip_ws(line(len_trim('end prog')+1:)))
+            if (len_trim(given_name) == 0) then
+                call handle_end_prog()
+                exit
+            else
+                if (to_lower(given_name) == to_lower(trim(current_prog_name))) then
+                    call handle_end_prog(given_name)
+                    exit
+                else
+                    errmsg = 'Error: end prog name "'//trim(given_name)//'" does not match '// &
+                             'current program "'//trim(current_prog_name)//'".'
+                    call push_line(outbuf, outcount, trim(errmsg)//' Use "end prog" to omit name.')
+                end if
+            end if
         end if
 
         if (.not. in_prog) cycle
@@ -96,7 +110,6 @@ program CLtranslator
     end do
 
 100 continue
-    ! If EOF inside program, flush once
     if (in_prog) then
         call handle_end_prog()
     end if
@@ -284,13 +297,25 @@ function int2s(i) result(s)
 end function
 
 ! ================= PARSER =================
-subroutine parse_line(cmd)
+recursive subroutine parse_line(cmd)
     character(len=*), intent(in) :: cmd
-    character(len=300) :: l, rest
+    character(len=300) :: l, rest, inner, cond
+    integer :: pwhile
 
     l = lstrip_ws(normalize_html(cmd))
 
-    ! If capturing a loop body
+    if (starts_with_keyword(l,'do')) then
+        pwhile = index(to_lower(l),' while ')
+        if (pwhile > 0 .and. loop_sp == 0) then
+            inner = trim(l(4:pwhile-1))
+            cond  = strip_ctrl_tail(l(pwhile+7:))
+            if (len_trim(inner) > 0) then
+                call exec_single_do_while(inner, cond)
+            end if
+            return
+        end if
+    end if
+
     if (loop_sp > 0) then
         ! If we are in a do-while and haven't seen "while" yet,
         ! check if this line is "while <cond>" (the closing condition line)
@@ -330,7 +355,6 @@ subroutine parse_line(cmd)
         return
     end if
 
-    ! IF blocks (top-level gating only; inside body they are captured as text)
     if (starts_with_keyword(l,'if')) then
         call handle_if(l); return
     end if
@@ -348,7 +372,6 @@ subroutine parse_line(cmd)
         if (.not. if_active(if_sp)) return
     end if
 
-    ! LOOP starts
     if (starts_with_keyword(l,'for') .or. &
         starts_with_keyword(l,'while') .or. &
         (trim(to_lower(l)) == 'do')) then
@@ -356,26 +379,22 @@ subroutine parse_line(cmd)
         return
     end if
 
-    ! stray end ... (ignore)
     if (starts_with_keyword(l,'end for') .or. &
         starts_with_keyword(l,'end while') .or. &
         starts_with_keyword(l,'end do')) then
         return
     end if
 
-    ! DECLARATION
     if (index(l,'::')>0 .and. index(l,'=')>0) then
         call store_variable(l)
         return
     end if
 
-    ! ASSIGNMENT (no '::', has '=' but not '==')
     if (index(l,'=')>0 .and. index(l,'==')==0) then
         call handle_assignment(l)
         return
     end if
 
-    ! PRINT (support "print expr" and "print, expr")
     if (starts_with_keyword(l,'print')) then
         rest = lstrip_ws(l(6:))
         if (len_trim(rest) > 0) then
@@ -386,6 +405,33 @@ subroutine parse_line(cmd)
         call do_print(rest)
         return
     end if
+end subroutine
+
+subroutine execute_stmt_list(list)
+    character(len=*), intent(in) :: list
+    character(len=300) :: s, part
+    integer :: p
+    s = trim(list)
+    do while (len_trim(s) > 0)
+        p = index(s, ';')
+        if (p > 0) then
+            part = trim(s(:p-1))
+            if (len_trim(part) > 0) call parse_line(part)
+            s = lstrip_ws(s(p+1:))
+        else
+            if (len_trim(s) > 0) call parse_line(s)
+            exit
+        end if
+    end do
+end subroutine
+
+subroutine exec_single_do_while(stmt, condition)
+    character(len=*), intent(in) :: stmt, condition
+    call execute_stmt_list(stmt)
+    do
+        if (.not. eval_bool_expr(condition)) exit
+        call execute_stmt_list(stmt)
+    end do
 end subroutine
 
 subroutine append_to_current_body(s)
@@ -983,6 +1029,8 @@ recursive subroutine eval_num_expr(expr, val, dp)
     integer :: p
     real :: vl, vr
     integer :: dpl, dpr
+    integer :: idx
+    character(len=200) :: left
 
     dp = 0
     val = 0.0
@@ -1024,8 +1072,29 @@ recursive subroutine eval_num_expr(expr, val, dp)
         return
     end if
 
+<<<<<<< HEAD
     ! += is handled at the assignment level, not inside numeric expression eval
     ! so we skip it here and fall through to get_val_dp
+=======
+    if (index(ex, ' += ') > 0) then
+        p = index(ex, ' += ')
+        call eval_num_expr(trim(ex(p+4:)),vr,dpr)
+        left = trim(ex(:p-1))
+        idx = get_var_index(left)
+        if (idx <= 0) then
+            call push_line(outbuf, outcount, 'Error: variable '//trim(left)//' not found')
+            val = 0.0
+            dp = 0
+            return
+        end if
+        read(vval(idx),*) vl
+        vl = vl + vr
+        write(vval(idx),*) vl
+        val = vl
+        dp = max(dp, dpr)
+        return
+    end if
+>>>>>>> 521d9d61c24255c412b0f9c3b0500c46e958336b
 
     call get_val_dp(ex,val,dp)
 end subroutine
@@ -1125,12 +1194,22 @@ subroutine get_val_dp(expr, val, dp)
 end subroutine
 
 ! ================= END PROGRAM =================
-subroutine handle_end_prog()
-    print *,'Program ',trim(current_prog_name),' ended.'
+subroutine handle_end_prog(given_name)
+    character(len=*), intent(in), optional :: given_name
+    character(len=64) :: pname
+    if (present(given_name) .and. len_trim(given_name) > 0) then
+        pname = trim(given_name)
+    else
+        pname = ''
+    end if
+    if (len_trim(pname) > 0) then
+        print *,'Program ',pname,' ended.'
+    else
+        print *,'Program ended.'
+    end if
     print *,'Output buffer:'
     call flush_output(outbuf, outcount)
 
-    ! Reset state for next program (REPL stays)
     vcount  = 0
     outcount= 0
     if_sp   = 0
