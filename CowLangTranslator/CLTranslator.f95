@@ -1130,8 +1130,34 @@ recursive subroutine eval_num_expr(expr, val, dp)
         return
     end if
 
+<<<<<<< HEAD
     ! += is handled at the assignment level, not inside numeric expression eval
     ! so we skip it here and fall through to get_val_dp
+=======
+<<<<<<< HEAD
+    ! += is handled at the assignment level, not inside numeric expression eval
+    ! so we skip it here and fall through to get_val_dp
+=======
+    if (index(ex, ' += ') > 0) then
+        p = index(ex, ' += ')
+        call eval_num_expr(trim(ex(p+4:)),vr,dpr)
+        left = trim(ex(:p-1))
+        idx = get_var_index(left)
+        if (idx <= 0) then
+            call push_line(outbuf, outcount, 'Error: variable '//trim(left)//' not found')
+            val = 0.0
+            dp = 0
+            return
+        end if
+        read(vval(idx),*) vl
+        vl = vl + vr
+        write(vval(idx),*) vl
+        val = vl
+        dp = max(dp, dpr)
+        return
+    end if
+>>>>>>> 521d9d61c24255c412b0f9c3b0500c46e958336b
+>>>>>>> 9907cdcab7ad78e3e20eb753dacb85e6dd6a5bf9
 
     call get_val_dp(ex,val,dp)
 end subroutine
