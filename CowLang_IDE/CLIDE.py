@@ -82,7 +82,7 @@ FILETYPES = [
     ("CL Full Release",       "*.cl"),
     ("CLP Source — pre/beta", "*.cowp"),
     ("CLP Full Release",      "*.clp"),
-    ("OX Files",              "*.ox")
+    ("OX Files",              "*.ox"),
     ("All Files",             "*.*"),
 ]
 
