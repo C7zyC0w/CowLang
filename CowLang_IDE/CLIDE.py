@@ -8,7 +8,7 @@ Run:           python clide.py
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
-import threading, subprocess, re, time, json, platform, base64, io
+import threading, subprocess, re, time, platform, base64, io
 from pathlib import Path
 
 try:
@@ -108,23 +108,10 @@ LANG_TOKENS = [
 ALL_KEYWORDS = KEYWORDS + TYPES + LANG_TOKENS
 INDENT = "  "
 
-def _cfg_dir()  -> Path: return Path.home() / ".config" / "clide"
-def _cfg_file() -> Path: return _cfg_dir() / "settings.json"
-
 DEFAULT_EXE = str(
     Path.home() / "CowLang" / "CowLang-main" / "CowLangTranslator" /
-    ("CLT_0.4.0.exe" if platform.system() == "Windows" else "CLT_0.4.0")
+    ("CLT_0.4.1.exe" if platform.system() == "Windows" else "CLT_0.4.1.elf")
 )
-
-def _find_exe() -> str:
-    p = Path.home() / "CowLang" / "cowlang.json"
-    if p.exists():
-        try:
-            d = json.loads(p.read_text())
-            if d.get("translator") and Path(d["translator"]).exists():
-                return d["translator"]
-        except Exception: pass
-    return DEFAULT_EXE
 
 def _strip_comment(line: str) -> str:
     in_s = in_d = esc = False
@@ -798,14 +785,14 @@ class CLIDE(ctk.CTk):
         self.autosave       = False
         self._autocomplete  = None
         self._find_visible  = False
-        self._cowlang_exe   = _find_exe()
+        self._cowlang_exe   = DEFAULT_EXE
         self._recent        = []
         self._term_height   = 200
         self._split         = False
         self._split_idx     = -1
         self._last_save_dir = str(Path.home())
+        self._running_proc  = None
 
-        self._load_settings()
         self._build_ui()
         self._apply_keybindings()
         self._schedule_autosave()
@@ -823,41 +810,9 @@ class CLIDE(ctk.CTk):
         return self._main_panel.text
 
     # ── Settings ─────────────────────────────────────────────────────────────
-    def _load_settings(self):
-        p=_cfg_file()
-        if not p.exists(): return
-        try:
-            d=json.loads(p.read_text())
-            self.autosave     =d.get("autosave",False)
-            self._cowlang_exe =d.get("cowlang_exe",self._cowlang_exe)
-            self._recent      =d.get("recent",[])
-            self._term_height =d.get("term_height",200)
-            self._last_save_dir=d.get("last_save_dir", str(Path.home()))
-            for f in d.get("open_files",[]):
-                if Path(f).exists(): self._tabs.append(EditorTab(f))
-            if not self._tabs and d.get("lastfile") and Path(d["lastfile"]).exists():
-                self._tabs.append(EditorTab(d["lastfile"]))
-            if self._tabs:
-                self._active_idx=min(d.get("active_tab",0),len(self._tabs)-1)
-        except Exception: pass
+    def _load_settings(self): pass
 
-    def _save_settings(self):
-        try:
-            _cfg_dir().mkdir(parents=True,exist_ok=True)
-            try:
-                sash_y=self.vert_pane.sash_coord(0)[1]
-                total=self.vert_pane.winfo_height()
-                self._term_height=max(60,total-sash_y)
-            except Exception: pass
-            _cfg_file().write_text(json.dumps({
-                "autosave":self.autosave,"cowlang_exe":self._cowlang_exe,
-                "recent":self._recent[:self.MAX_RECENT],
-                "term_height":self._term_height,
-                "last_save_dir":self._last_save_dir,
-                "open_files":[t.path for t in self._tabs if t.path],
-                "active_tab":self._active_idx,
-            },indent=2))
-        except Exception: pass
+    def _save_settings(self): pass
 
     def _push_recent(self,path):
         if path in self._recent: self._recent.remove(path)
@@ -1016,7 +971,7 @@ class CLIDE(ctk.CTk):
         self.terminal.bind("<Control-Shift-C>", lambda e: self._copy_terminal())
         tinput_row=tk.Frame(term_outer,bg=TERMINAL_BG,height=28)
         tinput_row.pack(fill="x"); tinput_row.pack_propagate(False)
-        tk.Label(tinput_row,text="$",bg=TERMINAL_BG,fg=ACCENT,
+        self._prompt_lbl=tk.Label(tinput_row,text="$",bg=TERMINAL_BG,fg=ACCENT,
                  font=("Courier New",12,"bold"),width=2).pack(side="left",padx=(8,0))
         self.term_input=tk.Entry(tinput_row,bg=TERMINAL_BG,fg=TEXT,insertbackground=ACCENT,
             font=("Courier New",12),relief="flat",bd=2,highlightthickness=0)
@@ -1377,42 +1332,50 @@ class CLIDE(ctk.CTk):
                 self.log(f"✗  Translator not found:\n   {self._cowlang_exe}")
                 self.log("   Run the CowLang Installer or set path in Settings."); return
             clt_dir=str(Path(self._cowlang_exe).parent)
+            m=re.search(r"CLT[_\-]?(\d+\.\d+[\.\d]*)",Path(self._cowlang_exe).name,re.IGNORECASE)
+            clt_ver=m.group(1) if m else "unknown"
+            self.log(f"   CLT version: {clt_ver}")
             src=Path(self.current_file).read_text(encoding="utf-8")
             start=time.time()
 
-            # Pass source via stdin only — no argv
             proc=subprocess.Popen(
                 [self._cowlang_exe],
                 cwd=clt_dir,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,   # separate stderr so we can suppress CLT debug noise
-                text=True)
-            stdout, stderr = proc.communicate(input=src)
-            elapsed=int((time.time()-start)*1000)
+                stderr=subprocess.DEVNULL,  # <<< FIX: kill >>> prompts
+                text=True,
+                bufsize=1)
+            self._running_proc=proc
 
+            # Send source then keep stdin open for user read() calls
+            proc.stdin.write(src + "\n")
+            proc.stdin.flush()
+
+            # Update prompt label to show >>> while program is running
+            self.after(0, lambda: self._prompt_lbl.configure(text=">>>", fg=WARN))
+
+            # Stream stdout line by line
             any_output=False
-            for line in stdout.splitlines():
-                self.log(line)
+            for line in proc.stdout:
+                self.log(line.rstrip())
                 any_output=True
 
-            # Show stderr if CLT produced any (compile errors etc.)
-            for line in stderr.splitlines():
-                if line.strip():
-                    self.log_error(f"  {line}")
-
-            # Exit code line — colour it green (0) or red (non-zero)
+            proc.wait()
+            elapsed=int((time.time()-start)*1000)
             code=proc.returncode
-            elapsed_s=f"{elapsed}ms"
             if code==0:
-                self.log_ok(f"\n✓  done in {elapsed_s} | exit 0")
+                self.log_ok(f"\n✓  done in {elapsed}ms | exit 0")
             else:
-                self.log_error(f"\n✗  done in {elapsed_s} | exit {code}")
+                self.log_error(f"\n✗  done in {elapsed}ms | exit {code}")
                 if not any_output:
                     self.log_error("   (no output — check translator path in Settings)")
 
         except Exception as e:
             self.log_error(f"✗  ERROR: {e}")
+        finally:
+            self._running_proc=None
+            self.after(0, lambda: self._prompt_lbl.configure(text="$", fg=ACCENT))
 
     # ── Terminal ──────────────────────────────────────────────────────────────
     def log(self,msg):
@@ -1462,11 +1425,22 @@ class CLIDE(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(content)
     def _run_shell_cmd(self,_=None):
-        cmd=self.term_input.get().strip()
-        if not cmd: return
-        self.term_input.delete(0,"end"); self.log(f"$ {cmd}")
+        text=self.term_input.get().strip()
+        if not text: return
+        self.term_input.delete(0,"end")
+        # If a CowLang program is running and waiting for input, pipe to it
+        if self._running_proc and self._running_proc.poll() is None:
+            self.log(f">>> {text}")
+            try:
+                self._running_proc.stdin.write(text+"\n")
+                self._running_proc.stdin.flush()
+            except Exception as e:
+                self.log_error(f"Input error: {e}")
+            return
+        # Otherwise run as a shell command
+        self.log(f"$ {text}")
         cwd=str(Path(self.current_file).parent) if self.current_file else None
-        threading.Thread(target=self._shell_thread,args=(cmd,cwd),daemon=True).start()
+        threading.Thread(target=self._shell_thread,args=(text,cwd),daemon=True).start()
     def _shell_thread(self,cmd,cwd):
         try:
             proc=subprocess.Popen(cmd,shell=True,cwd=cwd,

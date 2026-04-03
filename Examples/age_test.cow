@@ -1,4 +1,5 @@
 prog test
-  str :: age = read, "Enter Your Age"
+  !str :: age = read, "Enter Your Age"
+  age = 18
   print, age
 end prog

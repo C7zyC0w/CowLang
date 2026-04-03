@@ -1,18 +1,22 @@
 program CLtranslator
     implicit none
 
-    ! ================= PARAMETRES =================
-    integer, parameter :: MAXV   = 200
-    integer, parameter :: MAXIF  = 100
-    integer, parameter :: MAXLOOP= 100
-    integer, parameter :: MAXBODY= 4000
-    integer, parameter :: MAXOUT = 20000
+    ! ================= PARAMETERS =================
+    integer, parameter :: MAXV     = 200
+    integer, parameter :: MAXIF    = 100
+    integer, parameter :: MAXLOOP  = 100
+    integer, parameter :: MAXBODY  = 4000
+    integer, parameter :: MAXOUT   = 20000
+    integer, parameter :: MAXFUNC  = 30
+    integer, parameter :: MAXPARAM = 10
+    integer, parameter :: MAXFBODY = 400
+    integer, parameter :: MAXA     = 50
+    integer, parameter :: MAXELEM  = 200
 
-    ! ---- IO/Debug toggles ----
-    logical, parameter :: DIRECT_PRINT = .false.  ! false => buffer & flush at end prog
-    logical, parameter :: TRACE        = .false.  ! set true to see trace
+    logical, parameter :: DIRECT_PRINT = .false.
+    logical, parameter :: TRACE        = .false.
 
-    ! ================= VARIABLES =================
+    ! ================= SCALAR VARIABLE TABLE =================
     character(len=32)  :: vname(MAXV)
     character(len=16)  :: vtype(MAXV)
     character(len=200) :: vval(MAXV)
@@ -24,50 +28,84 @@ program CLtranslator
     character(len=64) :: given_name
     character(len=300) :: errmsg
 
-    ! ---- Output line buffer (used when DIRECT_PRINT=.false.) ----
+    ! ---- Output buffer ----
     character(len=1000) :: outbuf(MAXOUT)
     integer :: outcount
 
+    ! ---- If-stack ----
     logical :: if_active(MAXIF)
     logical :: if_matched(MAXIF)
     integer :: if_sp
 
     ! ================= LOOP STRUCT =================
     type :: loop_struct
-        character(len=16) :: ltype     ! "for", "while", "dowhile"
-        character(len=32) :: var       ! for loop var
+        character(len=16) :: ltype
+        character(len=32) :: var
         real              :: start, endv, step
-        character(len=200):: cond      ! while/dowhile condition
+        character(len=200):: cond
         integer           :: body_count
         character(len=300):: body(MAXBODY)
-        integer           :: nest      ! nesting depth while capturing body
-        logical           :: do_awaiting_while  ! true when inside "do...while" before "while" seen
+        integer           :: nest
+        logical           :: do_awaiting_while
     end type
 
     type(loop_struct) :: loops(MAXLOOP)
     integer :: loop_sp
 
-    ! ---- prompt strings ----
-    character(len=*), parameter :: PROMPT_MAIN   = '>>> '
-    character(len=*), parameter :: PROMPT_CONT   = '... '
+    ! ================= FUNCTION / PROCEDURE STRUCT =================
+    type :: func_struct
+        character(len=32) :: fname
+        character(len=8)  :: fkind        ! 'func' or 'proc'
+        integer           :: param_count
+        character(len=32) :: params(MAXPARAM)
+        integer           :: body_count
+        character(len=300):: body(MAXFBODY)
+    end type
+
+    type(func_struct) :: funcs(MAXFUNC)
+    integer :: func_count
+
+    logical :: in_func_def
+    integer :: current_func_idx
+    integer :: func_def_nest
+
+    ! ---- Return state ----
+    character(len=1000) :: return_value
+    logical             :: has_return
+
+    ! ================= ARRAY / LIST STORAGE =================
+    character(len=32)  :: aname(MAXA)
+    character(len=8)   :: akind(MAXA)     ! 'arr' or 'list'
+    integer            :: asize(MAXA)
+    character(len=200) :: avals(MAXA, MAXELEM)
+    integer            :: acount
+
+    ! ---- Prompts ----
+    character(len=*), parameter :: PROMPT_MAIN = '>>> '
+    character(len=*), parameter :: PROMPT_CONT = '... '
     integer :: depth, i
 
-    ! init
-    vcount  = 0
-    outcount= 0
-    if_sp   = 0
-    loop_sp = 0
-    in_prog = .false.
-    current_prog_name = ''
+    ! ================= INITIALISE =================
+    vcount           = 0
+    outcount         = 0
+    if_sp            = 0
+    loop_sp          = 0
+    in_prog          = .false.
+    current_prog_name= ''
+    func_count       = 0
+    in_func_def      = .false.
+    current_func_idx = 0
+    func_def_nest    = 0
+    has_return       = .false.
+    return_value     = ''
+    acount           = 0
 
     ! ================= MAIN REPL LOOP =================
     do
-        ! Prompts go to stderr (unit 0) so they never mix with program output
-        ! on stdout. Interactive terminal users still see them; pipe/IDE users don't.
         depth = loop_sp + if_sp
-        if (depth > 0) then
+        if (depth > 0 .or. in_func_def) then
             write(0,'(A)',advance='no') PROMPT_CONT
-            do i=1, depth-1
+            do i = 1, max(0, depth-1)
                 write(0,'(A)',advance='no') '    '
             end do
         else
@@ -76,12 +114,10 @@ program CLtranslator
 
         read(*,'(A)', end=100) line
 
-        ! Normalize & strip possible pasted prompts
         line = normalize_html(line)
         line = strip_any_prompt(line)
         line = lstrip_ws(line)
 
-        ! handle program start/end
         if (starts_with_keyword(line,'prog')) then
             current_prog_name = trim(extract_name_after_keyword(line,'prog'))
             in_prog = .true.
@@ -112,12 +148,11 @@ program CLtranslator
     end do
 
 100 continue
-    if (in_prog) then
-        call handle_end_prog()
-    end if
+    if (in_prog) call handle_end_prog()
 
 contains
-! ================== DEBUG / IO HELPERS ==================
+
+! ================== DEBUG / IO ==================
 subroutine dbg(msg)
     character(len=*), intent(in) :: msg
     if (TRACE) write(*,'(A)') '[TRACE] '//trim(msg)
@@ -125,8 +160,8 @@ end subroutine
 
 subroutine push_line(outbuf, outcount, s)
     character(len=1000), intent(inout) :: outbuf(:)
-    integer,            intent(inout) :: outcount
-    character(len=*),   intent(in)    :: s
+    integer,             intent(inout) :: outcount
+    character(len=*),    intent(in)    :: s
     if (DIRECT_PRINT) then
         write(*,'(A)') trim(s)
     else
@@ -141,11 +176,10 @@ end subroutine
 
 subroutine flush_output(outbuf, outcount)
     character(len=1000), intent(inout) :: outbuf(:)
-    integer,            intent(inout) :: outcount
+    integer,             intent(inout) :: outcount
     integer :: k
     if (DIRECT_PRINT) then
-        outcount = 0
-        return
+        outcount = 0; return
     end if
     do k = 1, outcount
         write(*,'(A)') trim(outbuf(k))
@@ -153,7 +187,7 @@ subroutine flush_output(outbuf, outcount)
     outcount = 0
 end subroutine
 
-! ================= UTIL FUNCTIONS =================
+! ================= UTILITY =================
 function to_lower(s) result(o)
     character(len=*), intent(in) :: s
     character(len=len(s)) :: o
@@ -162,6 +196,20 @@ function to_lower(s) result(o)
         c = iachar(s(i:i))
         if (c >= 65 .and. c <= 90) then
             o(i:i) = achar(c+32)
+        else
+            o(i:i) = s(i:i)
+        end if
+    end do
+end function
+
+function to_upper(s) result(o)
+    character(len=*), intent(in) :: s
+    character(len=len(s)) :: o
+    integer :: i, c
+    do i = 1, len(s)
+        c = iachar(s(i:i))
+        if (c >= 97 .and. c <= 122) then
+            o(i:i) = achar(c-32)
         else
             o(i:i) = s(i:i)
         end if
@@ -185,7 +233,6 @@ function lstrip_ws(s) result(o)
 end function
 
 function normalize_html(s) result(o)
-    ! Replace "&lt;" -> "<", "&gt;" -> ">", "&amp;" -> "&"
     character(len=*), intent(in) :: s
     character(len=len(s)) :: o
     integer :: i, w
@@ -193,43 +240,38 @@ function normalize_html(s) result(o)
     i = 1; w = 1
     do while (i <= len(s))
         if (i+3 <= len(s) .and. s(i:i+3) == '&lt;') then
-            if (w <= len(o)) o(w:w) = '<'; w = w + 1; i = i + 4
+            if (w <= len(o)) o(w:w) = '<'; w = w+1; i = i+4
         else if (i+3 <= len(s) .and. s(i:i+3) == '&gt;') then
-            if (w <= len(o)) o(w:w) = '>'; w = w + 1; i = i + 4
+            if (w <= len(o)) o(w:w) = '>'; w = w+1; i = i+4
         else if (i+4 <= len(s) .and. s(i:i+4) == '&amp;') then
-            if (w <= len(o)) o(w:w) = '&'; w = w + 1; i = i + 5
+            if (w <= len(o)) o(w:w) = '&'; w = w+1; i = i+5
         else
-            if (w <= len(o)) o(w:w) = s(i:i); w = w + 1; i = i + 1
+            if (w <= len(o)) o(w:w) = s(i:i); w = w+1; i = i+1
         end if
     end do
     if (w <= len(o)) o(w:) = ' '
 end function
 
 function strip_any_prompt(s) result(o)
-    ! Strip leading ">>> " or "... " and any following spaces
     character(len=*), intent(in) :: s
     character(len=len(s)) :: o
     character(len=:), allocatable :: t
     t = lstrip_ws(s)
     if (len_trim(t) >= 4) then
-        if (t(1:4) == '>>> ') then
-            o = lstrip_ws(t(5:)); return
-        end if
+        if (t(1:4) == '>>> ') then; o = lstrip_ws(t(5:)); return; end if
     end if
     if (len_trim(t) >= 4) then
-        if (t(1:4) == '... ') then
-            o = lstrip_ws(t(5:)); return
-        end if
+        if (t(1:4) == '... ') then; o = lstrip_ws(t(5:)); return; end if
     end if
     o = t
 end function
 
-logical function starts_with_keyword(s,kw)
+logical function starts_with_keyword(s, kw)
     character(len=*), intent(in) :: s, kw
     starts_with_keyword = index(to_lower(lstrip_ws(s)), trim(kw)) == 1
 end function
 
-function extract_name_after_keyword(s,kw) result(n)
+function extract_name_after_keyword(s, kw) result(n)
     character(len=*), intent(in) :: s, kw
     character(len=64) :: n
     n = trim(lstrip_ws(s(len_trim(kw)+1:)))
@@ -240,34 +282,42 @@ function strip_quotes(s) result(o)
     character(len=200) :: o
     if (len_trim(s) >= 2) then
         if (s(1:1) == '"' .and. s(len_trim(s):len_trim(s)) == '"') then
-            o = s(2:len_trim(s)-1)
-            return
+            o = s(2:len_trim(s)-1); return
         end if
     end if
     o = s
 end function
 
-! Remove trailing control words ("then"/"do") if present
+function strip_any_quotes(s) result(o)
+    character(len=*), intent(in) :: s
+    character(len=200) :: o
+    integer :: n
+    o = trim(s)
+    n = len_trim(o)
+    if (n >= 2) then
+        if ((o(1:1)=='"'  .and. o(n:n)=='"') .or. &
+            (o(1:1)=="'"  .and. o(n:n)=="'")) then
+            o = o(2:n-1)
+        end if
+    end if
+end function
+
 function rstrip_kw(s, kw) result(out)
     character(len=*), intent(in) :: s, kw
     character(len=200) :: out
     integer :: n, k
     character(len=200) :: low
     n = len_trim(s)
-    if (n <= 0) then
-        out = ''; return
-    end if
+    if (n <= 0) then; out = ''; return; end if
     low = to_lower(s(1:n))
     k = len_trim(kw)
     if (n >= k) then
         if (low(n-k+1:n) == to_lower(kw)) then
-            out = trim(s(1:n-k))
-            return
+            out = trim(s(1:n-k)); return
         end if
         if (n >= k+1) then
             if (low(n-k:n) == ' '//to_lower(kw)) then
-                out = trim(s(1:n-k-1))
-                return
+                out = trim(s(1:n-k-1)); return
             end if
         end if
     end if
@@ -284,11 +334,7 @@ end function
 pure function bool_str(x) result(s)
     logical, intent(in) :: x
     character(len=5) :: s
-    if (x) then
-        s = 'true '
-    else
-        s = 'false'
-    end if
+    if (x) then; s = 'true '; else; s = 'false'; end if
 end function
 
 function int2s(i) result(s)
@@ -298,6 +344,104 @@ function int2s(i) result(s)
     s = trim(s)
 end function
 
+function str_replace(src, old, new) result(res)
+    character(len=*), intent(in) :: src, old, new
+    character(len=1000) :: res, tmp
+    integer :: p, olen
+    res = trim(src)
+    olen = len_trim(old)
+    if (olen == 0) return
+    do
+        p = index(trim(res), trim(old))
+        if (p <= 0) exit
+        tmp = res(1:p-1)//trim(new)//trim(res(p+olen:len_trim(res)))
+        res = trim(tmp)
+    end do
+end function
+
+! ================= COMMA / QUOTE HELPERS =================
+subroutine find_comma_outside_quotes(s, pos)
+    character(len=*), intent(in)  :: s
+    integer,          intent(out) :: pos
+    integer :: i, n
+    logical :: in_sq, in_dq
+    pos = 0; in_sq = .false.; in_dq = .false.
+    n = len_trim(s)
+    do i = 1, n
+        if (.not. in_sq .and. .not. in_dq) then
+            if (s(i:i) == "'") in_sq = .true.
+            if (s(i:i) == '"') in_dq = .true.
+            if (s(i:i) == ',') then; pos = i; return; end if
+        else
+            if (in_sq .and. s(i:i) == "'") in_sq = .false.
+            if (in_dq .and. s(i:i) == '"') in_dq = .false.
+        end if
+    end do
+end subroutine
+
+! Split argument list respecting parens and quotes
+subroutine parse_arg_list(s, args, count)
+    character(len=*),   intent(in)  :: s
+    character(len=200), intent(out) :: args(MAXPARAM)
+    integer,            intent(out) :: count
+    character(len=400) :: rest
+    integer :: p, depth, i, n
+    logical :: in_sq, in_dq
+    count = 0
+    rest = trim(lstrip_ws(s))
+    do while (len_trim(rest) > 0 .and. count < MAXPARAM)
+        p = 0; depth = 0
+        in_sq = .false.; in_dq = .false.
+        n = len_trim(rest)
+        do i = 1, n
+            if (.not. in_sq .and. .not. in_dq) then
+                if (rest(i:i) == '(') depth = depth + 1
+                if (rest(i:i) == ')') depth = depth - 1
+                if (rest(i:i) == '"') in_dq = .true.
+                if (rest(i:i) == "'") in_sq = .true.
+                if (rest(i:i) == ',' .and. depth == 0) then
+                    p = i; exit
+                end if
+            else
+                if (in_dq .and. rest(i:i) == '"') in_dq = .false.
+                if (in_sq .and. rest(i:i) == "'") in_sq = .false.
+            end if
+        end do
+        count = count + 1
+        if (p > 0) then
+            args(count) = trim(lstrip_ws(rest(:p-1)))
+            rest = trim(lstrip_ws(rest(p+1:)))
+        else
+            args(count) = trim(lstrip_ws(rest))
+            rest = ''
+        end if
+    end do
+end subroutine
+
+subroutine parse_param_list(s, params, count)
+    character(len=*),  intent(in)  :: s
+    character(len=32), intent(out) :: params(MAXPARAM)
+    integer,           intent(out) :: count
+    character(len=200) :: rest, tok
+    integer :: p
+    count = 0
+    rest = trim(lstrip_ws(s))
+    do while (len_trim(rest) > 0 .and. count < MAXPARAM)
+        p = index(rest, ',')
+        if (p > 0) then
+            tok = trim(lstrip_ws(rest(:p-1)))
+            rest = trim(lstrip_ws(rest(p+1:)))
+        else
+            tok = trim(lstrip_ws(rest))
+            rest = ''
+        end if
+        if (len_trim(tok) > 0) then
+            count = count + 1
+            params(count) = tok
+        end if
+    end do
+end subroutine
+
 ! ================= PARSER =================
 recursive subroutine parse_line(cmd)
     character(len=*), intent(in) :: cmd
@@ -306,6 +450,28 @@ recursive subroutine parse_line(cmd)
 
     l = lstrip_ws(normalize_html(cmd))
 
+    ! ---- Function definition capture ----
+    if (in_func_def) then
+        if (starts_with_keyword(l,'func') .or. starts_with_keyword(l,'proc')) then
+            func_def_nest = func_def_nest + 1
+            call append_to_func_body(l)
+            return
+        end if
+        if (starts_with_keyword(l,'end func') .or. starts_with_keyword(l,'end proc')) then
+            if (func_def_nest > 0) then
+                func_def_nest = func_def_nest - 1
+                call append_to_func_body(l)
+            else
+                in_func_def = .false.
+                if (TRACE) call dbg('END DEF: '//trim(funcs(current_func_idx)%fname))
+            end if
+            return
+        end if
+        call append_to_func_body(l)
+        return
+    end if
+
+    ! ---- Inline do-while ----
     if (starts_with_keyword(l,'do')) then
         pwhile = index(to_lower(l),' while ')
         if (pwhile > 0 .and. loop_sp == 0) then
@@ -318,27 +484,22 @@ recursive subroutine parse_line(cmd)
         end if
     end if
 
+    ! ---- Loop body capture ----
     if (loop_sp > 0) then
-        ! If we are in a do-while and haven't seen "while" yet,
-        ! check if this line is "while <cond>" (the closing condition line)
         if (loops(loop_sp)%do_awaiting_while .and. loops(loop_sp)%nest == 0) then
             if (starts_with_keyword(l,'while')) then
                 loops(loop_sp)%cond = trim(lstrip_ws(l(6:)))
                 loops(loop_sp)%do_awaiting_while = .false.
-                if (TRACE) call dbg('DOWHILE got cond: ['//trim(loops(loop_sp)%cond)//']')
-                ! Now wait for "end do"
                 return
             end if
         end if
-
         if (starts_with_keyword(l,'for') .or. &
             starts_with_keyword(l,'while') .or. &
-            (trim(to_lower(l)) == 'do')) then
+            trim(to_lower(l)) == 'do') then
             loops(loop_sp)%nest = loops(loop_sp)%nest + 1
             call append_to_current_body(l)
             return
         end if
-
         if (starts_with_keyword(l,'end for') .or. &
             starts_with_keyword(l,'end while') .or. &
             starts_with_keyword(l,'end do')) then
@@ -352,11 +513,19 @@ recursive subroutine parse_line(cmd)
                 return
             end if
         end if
-
         call append_to_current_body(l)
         return
     end if
 
+    ! ---- Func/proc definition start ----
+    if (starts_with_keyword(l,'func') .and. .not. starts_with_keyword(l,'end func')) then
+        call handle_func_start(l, 'func'); return
+    end if
+    if (starts_with_keyword(l,'proc') .and. .not. starts_with_keyword(l,'end proc')) then
+        call handle_func_start(l, 'proc'); return
+    end if
+
+    ! ---- If/elif/else/end if ----
     if (starts_with_keyword(l,'if')) then
         call handle_if(l); return
     end if
@@ -374,48 +543,80 @@ recursive subroutine parse_line(cmd)
         if (.not. if_active(if_sp)) return
     end if
 
+    ! ---- Loop start ----
     if (starts_with_keyword(l,'for') .or. &
         starts_with_keyword(l,'while') .or. &
-        (trim(to_lower(l)) == 'do')) then
-        call handle_loop_start(l)
-        return
+        trim(to_lower(l)) == 'do') then
+        call handle_loop_start(l); return
     end if
-
     if (starts_with_keyword(l,'end for') .or. &
         starts_with_keyword(l,'end while') .or. &
         starts_with_keyword(l,'end do')) then
         return
     end if
 
-    if (index(l,'::')>0 .and. index(l,'=')>0) then
-        call store_variable(l)
+    ! ---- Return ----
+    if (starts_with_keyword(l,'return')) then
+        rest = trim(lstrip_ws(l(7:)))
+        has_return = .true.
+        if (len_trim(rest) > 0) then
+            return_value = trim(eval_expr_to_str(rest))
+        else
+            return_value = ''
+        end if
         return
     end if
 
-    if (index(l,'=')>0 .and. index(l,'==')==0) then
-        call handle_assignment(l)
-        return
+    ! ---- Call (procedure) ----
+    if (starts_with_keyword(l,'call')) then
+        rest = trim(lstrip_ws(l(5:)))
+        call dispatch_call(rest); return
     end if
 
+    ! ---- Array/list declarations ----
+    if (starts_with_keyword(l,'arr')) then
+        call handle_array_decl(l); return
+    end if
+    if (starts_with_keyword(l,'list')) then
+        call handle_list_decl(l); return
+    end if
+
+    ! ---- List ops ----
+    if (index(l,'.append(') > 0 .or. index(l,'.remove(') > 0 .or. index(l,'.pop(') > 0) then
+        call handle_list_op(l); return
+    end if
+
+    ! ---- Array element assign: name[i] = expr ----
+    if (index(l,'[') > 0 .and. index(l,'=') > 0 .and. index(l,'==') == 0) then
+        call handle_array_assign(l); return
+    end if
+
+    ! ---- Typed declaration: type :: name = expr ----
+    if (index(l,'::') > 0 .and. index(l,'=') > 0) then
+        call store_variable(l); return
+    end if
+
+    ! ---- Assignment ----
+    if (index(l,'=') > 0 .and. index(l,'==') == 0) then
+        call handle_assignment(l); return
+    end if
+
+    ! ---- Print ----
     if (starts_with_keyword(l,'print')) then
         rest = lstrip_ws(l(6:))
         if (len_trim(rest) > 0) then
-            if (rest(1:1) == ',') then
-                rest = lstrip_ws(rest(2:))
-            end if
+            if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
         end if
-        call do_print(rest)
-        return
+        call do_print(rest); return
     end if
 
+    ! ---- Read ----
     if (starts_with_keyword(l,'read')) then
         rest = lstrip_ws(l(5:))
-        ! strip optional leading comma  (e.g. "read, "prompt"")
         if (len_trim(rest) > 0) then
             if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
         end if
-        call do_read(rest)
-        return
+        call do_read(rest); return
     end if
 end subroutine
 
@@ -425,6 +626,7 @@ subroutine execute_stmt_list(list)
     integer :: p
     s = trim(list)
     do while (len_trim(s) > 0)
+        if (has_return) exit
         p = index(s, ';')
         if (p > 0) then
             part = trim(s(:p-1))
@@ -440,9 +642,11 @@ end subroutine
 subroutine exec_single_do_while(stmt, condition)
     character(len=*), intent(in) :: stmt, condition
     call execute_stmt_list(stmt)
+    if (has_return) return
     do
         if (.not. eval_bool_expr(condition)) exit
         call execute_stmt_list(stmt)
+        if (has_return) exit
     end do
 end subroutine
 
@@ -463,7 +667,7 @@ subroutine handle_if(line)
     logical :: r
     r = eval_bool_expr(strip_ctrl_tail(line(3:)))
     if_sp = if_sp + 1
-    if_active(if_sp) = r
+    if_active(if_sp)  = r
     if_matched(if_sp) = r
     if (TRACE) call dbg('IF -> '//trim(bool_str(r)))
 end subroutine
@@ -478,7 +682,7 @@ subroutine handle_elif(line)
     end if
     cond = strip_ctrl_tail(line(5:))
     r = eval_bool_expr(cond)
-    if_active(if_sp) = r
+    if_active(if_sp)  = r
     if_matched(if_sp) = r
     if (TRACE) call dbg('ELIF -> '//trim(bool_str(r)))
 end subroutine
@@ -486,30 +690,27 @@ end subroutine
 subroutine handle_else()
     if (if_sp == 0) return
     if (.not. if_matched(if_sp)) then
-        if_active(if_sp) = .true.
+        if_active(if_sp)  = .true.
         if_matched(if_sp) = .true.
     else
         if_active(if_sp) = .false.
     end if
-    if (TRACE) call dbg('ELSE active='//trim(bool_str(if_active(if_sp))))
 end subroutine
 
 subroutine handle_end_if()
     if (if_sp > 0) if_sp = if_sp - 1
-    if (TRACE) call dbg('END IF')
 end subroutine
 
 ! ================= LOOP CAPTURE + EXECUTE =================
 subroutine handle_loop_start(l)
     character(len=*), intent(in) :: l
-    integer :: p1,p2,p3,dpdum
+    integer :: p1, p2, p3, dpdum
     character(len=32) :: varname
     character(len=200) :: tmpstr_start, tmpstr_end, tmpstr_step, rest
     real :: startv, endv, stepv
     character(len=300) :: low
 
     low = to_lower(l)
-
     loop_sp = loop_sp + 1
     if (loop_sp > MAXLOOP) then
         loop_sp = MAXLOOP
@@ -517,13 +718,13 @@ subroutine handle_loop_start(l)
         return
     end if
 
-    loops(loop_sp)%body_count = 0
-    loops(loop_sp)%nest = 0
-    loops(loop_sp)%var = ''
-    loops(loop_sp)%cond = ''
-    loops(loop_sp)%start = 0.0
-    loops(loop_sp)%endv  = 0.0
-    loops(loop_sp)%step  = 1.0
+    loops(loop_sp)%body_count      = 0
+    loops(loop_sp)%nest            = 0
+    loops(loop_sp)%var             = ''
+    loops(loop_sp)%cond            = ''
+    loops(loop_sp)%start           = 0.0
+    loops(loop_sp)%endv            = 0.0
+    loops(loop_sp)%step            = 1.0
     loops(loop_sp)%do_awaiting_while = .false.
 
     if (starts_with_keyword(low,'for')) then
@@ -531,18 +732,13 @@ subroutine handle_loop_start(l)
         p1 = index(low,'range')
         p2 = index(low,' to ')
         p3 = index(low,' step ')
-
         if (p1 <= 0 .or. p2 <= 0) then
             call push_line(outbuf, outcount, 'Error: for loop syntax: for VAR range X to Y [step Z]')
-            loop_sp = loop_sp - 1
-            return
+            loop_sp = loop_sp - 1; return
         end if
-
-        varname = trim(lstrip_ws(l(5:p1-1)))
-
+        varname      = trim(lstrip_ws(l(5:p1-1)))
         tmpstr_start = trim(lstrip_ws(l(p1+5:p2-1)))
         call eval_num_expr(tmpstr_start, startv, dpdum)
-
         if (p3 > 0) then
             tmpstr_end  = trim(lstrip_ws(l(p2+4:p3-1)))
             tmpstr_step = trim(lstrip_ws(l(p3+6:)))
@@ -553,27 +749,19 @@ subroutine handle_loop_start(l)
             call eval_num_expr(tmpstr_end, endv, dpdum)
             stepv = 1.0
         end if
-
         loops(loop_sp)%var   = varname
         loops(loop_sp)%start = startv
         loops(loop_sp)%endv  = endv
         loops(loop_sp)%step  = stepv
-        if (TRACE) then
-            call dbg('FOR '//trim(varname)//' from '//trim(num_to_str(startv,0)))
-            call dbg('  to '//trim(num_to_str(endv,0))//' step '//trim(num_to_str(stepv,0)))
-        end if
 
     else if (starts_with_keyword(low,'while')) then
         loops(loop_sp)%ltype = 'while'
         rest = strip_ctrl_tail(l(6:))
         loops(loop_sp)%cond = rest
-        if (TRACE) call dbg('WHILE cond: ['//trim(rest)//']')
 
     else if (trim(low) == 'do') then
-        ! "do" alone starts a do-while body capture; "while <cond>" closes it
         loops(loop_sp)%ltype = 'dowhile'
         loops(loop_sp)%do_awaiting_while = .true.
-        if (TRACE) call dbg('DO (awaiting while <cond>)')
 
     else
         loops(loop_sp)%ltype = 'unknown'
@@ -587,18 +775,22 @@ subroutine run_loop(ls)
     select case (trim(ls%ltype))
     case ('for')
         val = ls%start
-        do while ( (ls%step >= 0.0 .and. val <= ls%endv) .or. (ls%step < 0.0 .and. val >= ls%endv) )
-            call set_variable(ls%var,'int',trim(num_to_str(val,0)))
+        do while ((ls%step >= 0.0 .and. val <= ls%endv) .or. &
+                  (ls%step <  0.0 .and. val >= ls%endv))
+            call set_variable(ls%var, 'int', trim(num_to_str(val,0)))
             call execute_block(ls%body, ls%body_count)
+            if (has_return) exit
             val = val + ls%step
         end do
     case ('while')
         do while (eval_bool_expr(ls%cond))
             call execute_block(ls%body, ls%body_count)
+            if (has_return) exit
         end do
     case ('dowhile')
         do
             call execute_block(ls%body, ls%body_count)
+            if (has_return) exit
             if (.not. eval_bool_expr(ls%cond)) exit
         end do
     case default
@@ -606,35 +798,129 @@ subroutine run_loop(ls)
     end select
 end subroutine
 
-subroutine execute_block(body, count)
+! Skip from a loop header to past its matching end (used when skipping dead branches)
+subroutine skip_to_end_loop(body, count, j)
+    character(len=300), intent(in) :: body(:)
+    integer,            intent(in) :: count
+    integer,         intent(inout) :: j
+    integer :: nest, k
+    character(len=300) :: bl
+    nest = 0
+    k = j + 1
+    do while (k <= count)
+        bl = to_lower(lstrip_ws(body(k)))
+        if (starts_with_keyword(bl,'for') .or. &
+            starts_with_keyword(bl,'while') .or. &
+            trim(bl) == 'do') then
+            nest = nest + 1
+        else if (starts_with_keyword(bl,'end for') .or. &
+                 starts_with_keyword(bl,'end while') .or. &
+                 starts_with_keyword(bl,'end do')) then
+            if (nest == 0) then
+                j = k + 1; return
+            else
+                nest = nest - 1
+            end if
+        end if
+        k = k + 1
+    end do
+    j = count + 1
+end subroutine
+
+recursive subroutine execute_block(body, count)
     character(len=300), intent(in) :: body(:)
     integer,            intent(in) :: count
 
     integer :: j, k, start_idx, nest, dpdum
-    character(len=300) :: s, low
+    character(len=300) :: s, low, rest
     type(loop_struct)  :: inner
     integer :: p1, p2, p3
     character(len=200) :: a, b, c
-    character(len=300) :: rest
+
+    ! Local if-stack for if/elif/else/end if inside blocks
+    logical :: blk_if_active(MAXIF), blk_if_matched(MAXIF)
+    integer :: blk_if_sp
+    logical :: cur_active, r2
+    character(len=200) :: blk_cond
+
+    blk_if_sp = 0
 
     j = 1
     do while (j <= count)
-        s = lstrip_ws(normalize_html(body(j)))
+        if (has_return) exit
+
+        s   = lstrip_ws(normalize_html(body(j)))
         low = to_lower(s)
 
-        ! Nested loop inside body
+        ! ---- Local if/elif/else/end if tracking ----
+        if (starts_with_keyword(low,'end if')) then
+            if (blk_if_sp > 0) blk_if_sp = blk_if_sp - 1
+            j = j + 1; cycle
+        end if
+
+        if (starts_with_keyword(low,'if') .and. .not. starts_with_keyword(low,'end if')) then
+            cur_active = (blk_if_sp == 0) .or. blk_if_active(blk_if_sp)
+            blk_if_sp = blk_if_sp + 1
+            if (blk_if_sp <= MAXIF) then
+                r2 = cur_active .and. eval_bool_expr(strip_ctrl_tail(s(3:)))
+                blk_if_active(blk_if_sp)  = r2
+                blk_if_matched(blk_if_sp) = r2
+            end if
+            j = j + 1; cycle
+        end if
+
+        if (starts_with_keyword(low,'elif')) then
+            if (blk_if_sp > 0) then
+                if (.not. blk_if_matched(blk_if_sp)) then
+                    cur_active = (blk_if_sp <= 1) .or. blk_if_active(blk_if_sp-1)
+                    blk_cond = strip_ctrl_tail(s(5:))
+                    r2 = cur_active .and. eval_bool_expr(blk_cond)
+                    blk_if_active(blk_if_sp)  = r2
+                    blk_if_matched(blk_if_sp) = r2
+                else
+                    blk_if_active(blk_if_sp) = .false.
+                end if
+            end if
+            j = j + 1; cycle
+        end if
+
+        if (starts_with_keyword(low,'else')) then
+            if (blk_if_sp > 0) then
+                if (.not. blk_if_matched(blk_if_sp)) then
+                    cur_active = (blk_if_sp <= 1) .or. blk_if_active(blk_if_sp-1)
+                    blk_if_active(blk_if_sp)  = cur_active
+                    blk_if_matched(blk_if_sp) = cur_active
+                else
+                    blk_if_active(blk_if_sp) = .false.
+                end if
+            end if
+            j = j + 1; cycle
+        end if
+
+        ! Skip inactive branch (skip loops too, but track their ends)
+        if (blk_if_sp > 0 .and. .not. blk_if_active(blk_if_sp)) then
+            if (starts_with_keyword(low,'for') .or. &
+                starts_with_keyword(low,'while') .or. &
+                trim(low) == 'do') then
+                call skip_to_end_loop(body, count, j)
+                cycle
+            end if
+            j = j + 1; cycle
+        end if
+
+        ! ---- Nested loop inside body ----
         if (starts_with_keyword(low,'for') .or. &
             starts_with_keyword(low,'while') .or. &
-            (trim(low) == 'do')) then
+            trim(low) == 'do') then
 
-            inner%body_count = 0
-            inner%nest = 0
-            inner%var = ''
-            inner%cond = ''
-            inner%start = 0.0
-            inner%endv  = 0.0
-            inner%step  = 1.0
-            inner%do_awaiting_while = .false.
+            inner%body_count         = 0
+            inner%nest               = 0
+            inner%var                = ''
+            inner%cond               = ''
+            inner%start              = 0.0
+            inner%endv               = 0.0
+            inner%step               = 1.0
+            inner%do_awaiting_while  = .false.
 
             if (starts_with_keyword(low,'for')) then
                 inner%ltype = 'for'
@@ -661,7 +947,7 @@ subroutine execute_block(body, count)
             do k = start_idx, count
                 if (starts_with_keyword(to_lower(lstrip_ws(body(k))),'for') .or. &
                     starts_with_keyword(to_lower(lstrip_ws(body(k))),'while') .or. &
-                    (trim(to_lower(lstrip_ws(body(k)))) == 'do')) then
+                    trim(to_lower(lstrip_ws(body(k)))) == 'do') then
                     nest = nest + 1
                     if (inner%body_count < MAXBODY) then
                         inner%body_count = inner%body_count + 1
@@ -681,11 +967,9 @@ subroutine execute_block(body, count)
                     end if
                 else if (inner%do_awaiting_while .and. nest == 0 .and. &
                          starts_with_keyword(to_lower(lstrip_ws(body(k))),'while')) then
-                    ! This is the "while <cond>" line for the do-while
                     a = lstrip_ws(body(k))
                     inner%cond = trim(lstrip_ws(a(6:)))
                     inner%do_awaiting_while = .false.
-                    ! Don't add to body; next line should be "end do"
                 else
                     if (inner%body_count < MAXBODY) then
                         inner%body_count = inner%body_count + 1
@@ -699,47 +983,455 @@ subroutine execute_block(body, count)
             cycle
         end if
 
-        ! Declarations inside body
-        if (index(s,'::')>0 .and. index(s,'=')>0) then
-            call store_variable(s)
-            j = j + 1
-            cycle
+        ! ---- return ----
+        if (starts_with_keyword(s,'return')) then
+            rest = trim(lstrip_ws(s(7:)))
+            has_return = .true.
+            if (len_trim(rest) > 0) then
+                return_value = trim(eval_expr_to_str(rest))
+            else
+                return_value = ''
+            end if
+            exit
         end if
 
-        ! Assignment inside body
-        if (index(s,'=')>0 .and. index(s,'==')==0) then
-            call handle_assignment(s)
-            j = j + 1
-            cycle
+        ! ---- call (procedure) ----
+        if (starts_with_keyword(s,'call')) then
+            rest = trim(lstrip_ws(s(5:)))
+            call dispatch_call(rest)
+            j = j + 1; cycle
         end if
 
-        ! print
+        ! ---- arr/list declarations ----
+        if (starts_with_keyword(s,'arr')) then
+            call handle_array_decl(s); j = j + 1; cycle
+        end if
+        if (starts_with_keyword(s,'list')) then
+            call handle_list_decl(s); j = j + 1; cycle
+        end if
+
+        ! ---- list ops ----
+        if (index(s,'.append(') > 0 .or. index(s,'.remove(') > 0 .or. index(s,'.pop(') > 0) then
+            call handle_list_op(s); j = j + 1; cycle
+        end if
+
+        ! ---- array element assign ----
+        if (index(s,'[') > 0 .and. index(s,'=') > 0 .and. index(s,'==') == 0) then
+            call handle_array_assign(s); j = j + 1; cycle
+        end if
+
+        ! ---- typed declaration ----
+        if (index(s,'::') > 0 .and. index(s,'=') > 0) then
+            call store_variable(s); j = j + 1; cycle
+        end if
+
+        ! ---- assignment ----
+        if (index(s,'=') > 0 .and. index(s,'==') == 0) then
+            call handle_assignment(s); j = j + 1; cycle
+        end if
+
+        ! ---- print ----
         if (starts_with_keyword(s,'print')) then
             rest = lstrip_ws(s(6:))
             if (len_trim(rest) > 0) then
-                if (rest(1:1) == ',') then
-                    rest = lstrip_ws(rest(2:))
-                end if
+                if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
             end if
-            call do_print(rest)
-            j = j + 1
-            cycle
+            call do_print(rest); j = j + 1; cycle
         end if
 
-        ! read
+        ! ---- read ----
         if (starts_with_keyword(s,'read')) then
             rest = lstrip_ws(s(5:))
             if (len_trim(rest) > 0) then
                 if (rest(1:1) == ',') rest = lstrip_ws(rest(2:))
             end if
-            call do_read(rest)
-            j = j + 1
-            cycle
+            call do_read(rest); j = j + 1; cycle
         end if
 
         j = j + 1
     end do
 end subroutine
+
+! ================= FUNCTION / PROCEDURE SYSTEM =================
+subroutine handle_func_start(l, kind)
+    character(len=*), intent(in) :: l, kind
+    integer :: p1, p2
+    character(len=32) :: fname
+    character(len=200) :: paramstr
+    character(len=32) :: params(MAXPARAM)
+    integer :: pcount
+
+    p1 = index(l,'(')
+    p2 = index(l,')')
+    pcount = 0
+
+    if (p1 <= 0) then
+        fname = trim(lstrip_ws(l(len_trim(kind)+1:)))
+    else
+        fname = trim(lstrip_ws(l(len_trim(kind)+1:p1-1)))
+        if (p2 > p1+1) then
+            paramstr = l(p1+1:p2-1)
+            call parse_param_list(paramstr, params, pcount)
+        end if
+    end if
+
+    if (func_count >= MAXFUNC) then
+        call push_line(outbuf, outcount, 'Error: too many functions/procedures')
+        return
+    end if
+    func_count = func_count + 1
+    funcs(func_count)%fname       = trim(fname)
+    funcs(func_count)%fkind       = trim(kind)
+    funcs(func_count)%param_count = pcount
+    funcs(func_count)%params(1:pcount) = params(1:pcount)
+    funcs(func_count)%body_count  = 0
+
+    in_func_def      = .true.
+    current_func_idx = func_count
+    func_def_nest    = 0
+    if (TRACE) call dbg('DEF '//trim(kind)//': '//trim(fname))
+end subroutine
+
+subroutine append_to_func_body(s)
+    character(len=*), intent(in) :: s
+    if (funcs(current_func_idx)%body_count < MAXFBODY) then
+        funcs(current_func_idx)%body_count = funcs(current_func_idx)%body_count + 1
+        funcs(current_func_idx)%body(funcs(current_func_idx)%body_count) = s
+    else
+        call push_line(outbuf, outcount, 'Error: function body too large')
+    end if
+end subroutine
+
+integer function get_func_index(name)
+    character(len=*), intent(in) :: name
+    integer :: i
+    get_func_index = 0
+    do i = 1, func_count
+        if (to_lower(trim(funcs(i)%fname)) == to_lower(trim(name))) then
+            get_func_index = i; return
+        end if
+    end do
+end function
+
+subroutine dispatch_call(rest)
+    character(len=*), intent(in) :: rest
+    character(len=32)  :: fname
+    character(len=200) :: argstr, args(MAXPARAM)
+    character(len=1000):: dummy
+    integer :: argc, p1, p2, fidx
+
+    p1 = index(rest,'(')
+    p2 = index(rest,')')
+    argc = 0
+
+    if (p1 <= 0) then
+        fname = trim(rest)
+    else
+        fname = trim(lstrip_ws(rest(:p1-1)))
+        if (p2 > p1+1) then
+            argstr = rest(p1+1:p2-1)
+            call parse_arg_list(argstr, args, argc)
+        end if
+    end if
+
+    fidx = get_func_index(fname)
+    if (fidx <= 0) then
+        call push_line(outbuf, outcount, 'Error: unknown procedure "'//trim(fname)//'"')
+        return
+    end if
+    call invoke_func(fidx, args, argc, dummy)
+end subroutine
+
+subroutine invoke_func(fidx, args, argc, result)
+    integer,            intent(in)  :: fidx, argc
+    character(len=200), intent(in)  :: args(MAXPARAM)
+    character(len=1000),intent(out) :: result
+
+    integer :: saved_vcount, k
+    character(len=1000) :: arg_val
+
+    saved_vcount = vcount
+
+    ! Bind parameters
+    do k = 1, funcs(fidx)%param_count
+        if (k <= argc) then
+            arg_val = trim(eval_expr_to_str(args(k)))
+        else
+            arg_val = ''
+        end if
+        call set_or_create_var(trim(funcs(fidx)%params(k)), 'str', trim(arg_val))
+    end do
+
+    has_return   = .false.
+    return_value = ''
+    call execute_block(funcs(fidx)%body, funcs(fidx)%body_count)
+
+    result       = trim(return_value)
+    has_return   = .false.
+    return_value = ''
+
+    ! Pop local variables (restore frame)
+    vcount = saved_vcount
+end subroutine
+
+! ================= ARRAY / LIST SYSTEM =================
+integer function get_array_index(name)
+    character(len=*), intent(in) :: name
+    integer :: i
+    get_array_index = 0
+    do i = 1, acount
+        if (to_lower(trim(aname(i))) == to_lower(trim(name))) then
+            get_array_index = i; return
+        end if
+    end do
+end function
+
+subroutine handle_array_decl(l)
+    ! arr :: name[size]
+    ! arr :: name[size] = {"a","b","c"}
+    character(len=*), intent(in) :: l
+    character(len=200) :: rest, anam, sizestr, initstr
+    integer :: p2, pb, pe, p3, sz, ai, m
+
+    p2 = index(l,'::')
+    if (p2 <= 0) then
+        call push_line(outbuf, outcount, 'Error: arr syntax: arr :: name[size]'); return
+    end if
+    rest = trim(lstrip_ws(l(p2+2:)))
+    pb = index(rest,'['); pe = index(rest,']')
+    if (pb <= 0 .or. pe <= pb) then
+        call push_line(outbuf, outcount, 'Error: arr syntax: arr :: name[size]'); return
+    end if
+    anam    = trim(lstrip_ws(rest(:pb-1)))
+    sizestr = trim(rest(pb+1:pe-1))
+    sz = nint(eval_num_expr_val(sizestr))
+    if (sz < 1 .or. sz > MAXELEM) then
+        call push_line(outbuf, outcount, 'Error: array size must be 1-'//trim(int2s(MAXELEM))); return
+    end if
+
+    ai = get_array_index(anam)
+    if (ai <= 0) then
+        if (acount >= MAXA) then
+            call push_line(outbuf, outcount, 'Error: too many arrays/lists'); return
+        end if
+        acount = acount + 1; ai = acount
+    end if
+    aname(ai) = trim(anam)
+    akind(ai) = 'arr'
+    asize(ai) = sz
+    do m = 1, MAXELEM
+        avals(ai,m) = ''
+    end do
+
+    ! Optional initialiser
+    p3 = index(l,'=')
+    if (p3 > 0 .and. p3 > p2 + pe) then
+        initstr = trim(lstrip_ws(l(p3+1:)))
+        call init_array_from_brace(ai, sz, initstr)
+    end if
+    if (TRACE) call dbg('ARR '//trim(anam)//'['//trim(int2s(sz))//']')
+end subroutine
+
+subroutine handle_list_decl(l)
+    ! list :: name
+    ! list :: name = {"a","b","c"}
+    character(len=*), intent(in) :: l
+    character(len=200) :: rest, lnam, initstr
+    integer :: p2, p3, ai, m
+
+    p2 = index(l,'::')
+    if (p2 <= 0) then
+        call push_line(outbuf, outcount, 'Error: list syntax: list :: name'); return
+    end if
+    rest = trim(lstrip_ws(l(p2+2:)))
+    p3 = index(rest,'=')
+    if (p3 > 0) then
+        lnam    = trim(lstrip_ws(rest(:p3-1)))
+        initstr = trim(lstrip_ws(rest(p3+1:)))
+    else
+        lnam    = trim(lstrip_ws(rest))
+        initstr = ''
+    end if
+
+    ai = get_array_index(lnam)
+    if (ai <= 0) then
+        if (acount >= MAXA) then
+            call push_line(outbuf, outcount, 'Error: too many arrays/lists'); return
+        end if
+        acount = acount + 1; ai = acount
+    end if
+    aname(ai) = trim(lnam)
+    akind(ai) = 'list'
+    asize(ai) = 0
+    do m = 1, MAXELEM
+        avals(ai,m) = ''
+    end do
+
+    if (len_trim(initstr) > 0) then
+        call init_array_from_brace(ai, MAXELEM, initstr)
+        ! Count how many were filled
+        asize(ai) = 0
+        do m = 1, MAXELEM
+            if (len_trim(avals(ai,m)) == 0) exit
+            asize(ai) = m
+        end do
+    end if
+    if (TRACE) call dbg('LIST '//trim(lnam))
+end subroutine
+
+subroutine init_array_from_brace(ai, maxsz, s)
+    integer, intent(in) :: ai, maxsz
+    character(len=*), intent(in) :: s
+    character(len=400) :: rest, tok
+    integer :: p, ecount, n
+
+    rest = trim(lstrip_ws(s))
+    ! Strip braces
+    if (len_trim(rest) >= 1) then
+        if (rest(1:1) == '{') rest = trim(lstrip_ws(rest(2:)))
+    end if
+    n = len_trim(rest)
+    if (n >= 1) then
+        if (rest(n:n) == '}') rest = trim(rest(:n-1))
+    end if
+
+    ecount = 0
+    do while (len_trim(rest) > 0 .and. ecount < maxsz)
+        p = index(rest, ',')
+        if (p > 0) then
+            tok  = trim(lstrip_ws(rest(:p-1)))
+            rest = trim(lstrip_ws(rest(p+1:)))
+        else
+            tok  = trim(lstrip_ws(rest))
+            rest = ''
+        end if
+        ecount = ecount + 1
+        avals(ai, ecount) = trim(strip_any_quotes(tok))
+    end do
+end subroutine
+
+subroutine handle_array_assign(l)
+    ! name[i] = expr
+    character(len=*), intent(in) :: l
+    character(len=200) :: anam, idx_str, expr_str
+    integer :: pb, pe, peq, aidx, elem_idx
+
+    pb  = index(l,'[')
+    pe  = index(l,']')
+    peq = index(l,'=')
+
+    if (pb <= 0 .or. pe <= pb .or. peq <= pe) then
+        call handle_assignment(l); return
+    end if
+
+    anam     = trim(lstrip_ws(l(:pb-1)))
+    idx_str  = trim(l(pb+1:pe-1))
+    expr_str = trim(lstrip_ws(l(peq+1:)))
+
+    elem_idx = nint(eval_num_expr_val(idx_str))
+    aidx = get_array_index(anam)
+    if (aidx <= 0) then
+        call push_line(outbuf, outcount, 'Error: unknown array "'//trim(anam)//'"'); return
+    end if
+    if (elem_idx < 1 .or. elem_idx > MAXELEM) then
+        call push_line(outbuf, outcount, 'Error: array index out of bounds'); return
+    end if
+
+    avals(aidx, elem_idx) = trim(eval_expr_to_str(expr_str))
+    if (akind(aidx) == 'list' .and. elem_idx > asize(aidx)) then
+        asize(aidx) = elem_idx
+    end if
+end subroutine
+
+subroutine handle_list_op(l)
+    ! name.append(val)  name.remove(i)  name.pop()
+    character(len=*), intent(in) :: l
+    character(len=200) :: lnam, op, argstr
+    integer :: pd, pb, pe, aidx, idx, m
+
+    pd = index(l,'.')
+    pb = index(l,'(')
+    pe = index(l,')')
+    if (pd <= 0 .or. pb <= pd .or. pe < pb) return
+
+    lnam   = trim(lstrip_ws(l(:pd-1)))
+    op     = trim(lstrip_ws(l(pd+1:pb-1)))
+    argstr = trim(lstrip_ws(l(pb+1:pe-1)))
+
+    aidx = get_array_index(lnam)
+    if (aidx <= 0) then
+        call push_line(outbuf, outcount, 'Error: unknown list "'//trim(lnam)//'"'); return
+    end if
+
+    select case (to_lower(trim(op)))
+    case ('append')
+        if (asize(aidx) < MAXELEM) then
+            asize(aidx) = asize(aidx) + 1
+            avals(aidx, asize(aidx)) = trim(eval_expr_to_str(argstr))
+        else
+            call push_line(outbuf, outcount, 'Error: list is full')
+        end if
+    case ('remove')
+        idx = nint(eval_num_expr_val(argstr))
+        if (idx >= 1 .and. idx <= asize(aidx)) then
+            do m = idx, asize(aidx)-1
+                avals(aidx,m) = avals(aidx,m+1)
+            end do
+            avals(aidx, asize(aidx)) = ''
+            asize(aidx) = asize(aidx) - 1
+        else
+            call push_line(outbuf, outcount, 'Error: list index out of bounds')
+        end if
+    case ('pop')
+        if (asize(aidx) > 0) then
+            avals(aidx, asize(aidx)) = ''
+            asize(aidx) = asize(aidx) - 1
+        end if
+    end select
+end subroutine
+
+! ================= EXPRESSION EVALUATOR (top-level) =================
+! Evaluates any expression to a string result (string or numeric)
+function eval_expr_to_str(expr) result(res)
+    character(len=*), intent(in) :: expr
+    character(len=1000) :: res
+    character(len=300) :: ex
+    real :: numval
+    integer :: dp
+    character(len=200) :: rv
+
+    ex = trim(lstrip_ws(normalize_html(expr)))
+    res = ''
+
+    ! String literal or concat
+    if (len_trim(ex) >= 1 .and. ex(1:1) == '"') then
+        if (expr_has_str_op(ex)) then
+            res = eval_str_expr(ex)
+        else
+            res = strip_quotes(ex)
+        end if
+        return
+    end if
+
+    if (expr_has_str_op(ex)) then
+        res = eval_str_expr(ex)
+        return
+    end if
+
+    ! Try resolve_value (handles vars, array elems, builtins, func calls)
+    rv = trim(resolve_value(ex))
+    if (trim(rv) /= trim(ex)) then
+        res = rv; return
+    end if
+
+    ! Try numeric
+    call eval_num_expr(ex, numval, dp)
+    if (dp > 0) then
+        res = trim(num_to_str(numval, max(1,dp)))
+    else
+        res = trim(num_to_str(numval, 0))
+    end if
+end function
 
 ! ================= ASSIGNMENT =================
 subroutine handle_assignment(line)
@@ -756,10 +1448,9 @@ subroutine handle_assignment(line)
     name = trim(lstrip_ws(line(:p-1)))
     expr = trim(lstrip_ws(line(p+1:)))
 
-    ! string literal
+    ! String literal
     if (len_trim(expr) >= 1) then
         if (expr(1:1) == '"') then
-            ! still check for concat: "hello" & varname
             if (expr_has_str_op(expr)) then
                 sval = eval_str_expr(expr)
                 call set_or_create_var(name, 'str', trim(sval))
@@ -771,12 +1462,43 @@ subroutine handle_assignment(line)
         end if
     end if
 
-    ! variable or expression containing & or + for string concat
+    ! String concat
     if (expr_has_str_op(expr)) then
         sval = eval_str_expr(expr)
-        ! keep the existing type if variable already declared, else str
         call set_or_create_var(name, 'str', trim(sval))
         return
+    end if
+
+    ! Check if it's a function/builtin call (has parens but not a plain number)
+    if (index(expr,'(') > 0) then
+        sval = trim(resolve_value(expr))
+        if (trim(sval) /= trim(expr)) then
+            ! Determine if result looks numeric
+            call eval_num_expr(sval, val, dp)
+            if (dp > 0) then
+                call set_or_create_var(name, 'float', trim(sval))
+            else
+                ! Try integer
+                read(sval,*,err=50,end=50) val
+                if (nint(val) == val .and. index(sval,'.') == 0) then
+                    call set_or_create_var(name, 'int', trim(sval))
+                else
+                    call set_or_create_var(name, 'float', trim(sval))
+                end if
+                return
+50              call set_or_create_var(name, 'str', trim(sval))
+            end if
+            return
+        end if
+    end if
+
+    ! Array element on RHS: name[i]
+    if (index(expr,'[') > 0) then
+        sval = trim(resolve_value(expr))
+        if (trim(sval) /= trim(expr)) then
+            call set_or_create_var(name, 'str', trim(sval))
+            return
+        end if
     end if
 
     call eval_num_expr(expr, val, dp)
@@ -810,37 +1532,25 @@ subroutine set_or_create_var(name, typ, val)
     end if
 end subroutine
 
-! ================= VARIABLE + PRINT + STRINGS + CONDITIONS =================
+! ================= VARIABLE STORE =================
 subroutine store_variable(cmd)
     character(len=*), intent(in) :: cmd
     character(len=32)  :: name, typ
     character(len=200) :: val, expr_str
     integer :: p2, p3
-    real :: numval
-    integer :: dp
 
     p2 = index(cmd,'::')
     p3 = index(cmd,'=')
-
     read(cmd(:p2-1),*) typ
     typ      = to_lower(trim(typ))
     name     = trim(lstrip_ws(cmd(p2+2:p3-1)))
     expr_str = trim(lstrip_ws(cmd(p3+1:)))
 
-    ! If the expression contains & or + (outside quotes) treat as str concat
     if (expr_has_str_op(expr_str)) then
         val = eval_str_expr(expr_str)
-        if (vcount < MAXV) then
-            vcount = vcount + 1
-            vname(vcount) = trim(name)
-            vtype(vcount) = typ
-            vval(vcount)  = trim(val)
-        end if
-        return
+    else
+        val = trim(strip_quotes(expr_str))
     end if
-
-    ! plain literal or numeric
-    val = trim(strip_quotes(expr_str))
 
     if (vcount < MAXV) then
         vcount = vcount + 1
@@ -865,28 +1575,25 @@ integer function get_var_index(name)
     integer :: i
     get_var_index = 0
     do i = 1, vcount
-        if (to_lower(vname(i)) == to_lower(trim(name))) then
-            get_var_index = i
-            return
+        if (to_lower(trim(vname(i))) == to_lower(trim(name))) then
+            get_var_index = i; return
         end if
     end do
 end function
 
-! ---- tokenizer for print: supports + (tight) and & (space). Also detects literal "&amp;".
+! ================= PRINT =================
 subroutine next_token_and_op(s, token, op)
-    character(len=*),  intent(inout) :: s
-    character(len=200),intent(out)   :: token
-    character,         intent(out)   :: op
+    character(len=*),   intent(inout) :: s
+    character(len=200), intent(out)   :: token
+    character,          intent(out)   :: op
     integer :: i, n
     logical :: in_squote, in_dquote
     character(len=400) :: t
 
     token = ''; op = char(0)
-    t = lstrip_ws(normalize_html(s))      ! Option A: normalize &amp; -> &
+    t = lstrip_ws(normalize_html(s))
     n = len_trim(t)
-    if (n == 0) then
-        s = ''; return
-    end if
+    if (n == 0) then; s = ''; return; end if
 
     in_squote = .false.; in_dquote = .false.
     i = 1
@@ -899,22 +1606,13 @@ subroutine next_token_and_op(s, token, op)
             else if (t(i:i) == '&' .or. t(i:i) == '+') then
                 token = trim(t(1:i-1))
                 op = t(i:i)
-                if (i+1 <= n) then
-                    s = lstrip_ws(t(i+1:))
-                else
-                    s = ''
-                end if
+                if (i+1 <= n) then; s = lstrip_ws(t(i+1:)); else; s = ''; end if
                 return
             else if (i+4 <= n) then
-                ! Option B: detect literal "&amp;" as '&'
                 if (t(i:i+4) == '&amp;') then
                     token = trim(t(1:i-1))
                     op = '&'
-                    if (i+5 <= n) then
-                        s = lstrip_ws(t(i+5:))
-                    else
-                        s = ''
-                    end if
+                    if (i+5 <= n) then; s = lstrip_ws(t(i+5:)); else; s = ''; end if
                     return
                 end if
             end if
@@ -924,7 +1622,6 @@ subroutine next_token_and_op(s, token, op)
         end if
         i = i + 1
     end do
-
     token = trim(t(1:n))
     op = char(0)
     s = ''
@@ -944,49 +1641,203 @@ subroutine do_print(expr)
     do
         call next_token_and_op(rest, token, op)
         if (len_trim(token) == 0 .and. op == char(0)) exit
-
         piece = trim(resolve_value(token))
-
         if (.not. first) then
-            if (last_op == '&') then
-                lineout = trim(lineout)//' '
-            end if
+            if (last_op == '&') lineout = trim(lineout)//' '
         end if
-
-        if (len_trim(piece) > 0) then
-            lineout = trim(lineout)//trim(piece)
-        end if
-
+        if (len_trim(piece) > 0) lineout = trim(lineout)//trim(piece)
         if (op == char(0)) exit
         last_op = op
         first = .false.
     end do
-
     call push_line(outbuf, outcount, trim(lineout))
 end subroutine
 
+! ================= RESOLVE VALUE (single token) =================
+! Handles: string literals, variables, array[i], func(args), builtins
 function resolve_value(tok) result(res)
     character(len=*), intent(in) :: tok
     character(len=200) :: res
-    integer :: i
+    integer :: i, pb, pe
     real :: rtmp
     integer :: itmp
-    character(len=200) :: ttrim, tok_lower, s
+    character(len=200) :: ttrim, tok_lower, sv, fname_s, idx_str, aname_tok
+    character(len=200) :: args(MAXPARAM)
+    integer :: argc, fidx, aidx, elem_idx
+    character(len=1000) :: func_result
 
-    ttrim = trim(lstrip_ws(tok))
+    ttrim     = trim(lstrip_ws(tok))
     tok_lower = to_lower(ttrim)
     res = ''
 
-    ! string literal
+    if (len_trim(ttrim) == 0) return
+
+    ! String literal "..."
     if (len_trim(ttrim) >= 2) then
-        if ( (ttrim(1:1) == '"' .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == '"') .or. &
-             (ttrim(1:1) == "''" .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == "''") ) then
-            res = ttrim(2:len_trim(ttrim)-1)
-            return
+        if (ttrim(1:1) == '"' .and. ttrim(len_trim(ttrim):len_trim(ttrim)) == '"') then
+            res = ttrim(2:len_trim(ttrim)-1); return
         end if
     end if
 
-    ! lookup variable
+    ! Array element: name[i]
+    pb = index(ttrim,'[')
+    pe = index(ttrim,']')
+    if (pb > 0 .and. pe > pb) then
+        aname_tok = trim(ttrim(:pb-1))
+        idx_str   = trim(ttrim(pb+1:pe-1))
+        elem_idx  = nint(eval_num_expr_val(idx_str))
+        aidx = get_array_index(aname_tok)
+        if (aidx > 0) then
+            if (elem_idx >= 1 .and. elem_idx <= asize(aidx)) then
+                res = trim(avals(aidx, elem_idx))
+            else
+                res = 'Error: array index out of bounds'
+            end if
+        else
+            res = 'Error: unknown array "'//trim(aname_tok)//'"'
+        end if
+        return
+    end if
+
+    ! Function call or builtin: name(args)
+    pb = index(ttrim,'(')
+    pe = len_trim(ttrim)
+    if (pb > 0 .and. pe >= pb .and. ttrim(pe:pe) == ')') then
+        fname_s = trim(ttrim(:pb-1))
+        argc = 0
+        if (pe > pb+1) then
+            call parse_arg_list(ttrim(pb+1:pe-1), args, argc)
+        end if
+
+        select case (to_lower(trim(fname_s)))
+
+        ! ---- Built-in string functions ----
+        case ('len')
+            if (argc >= 1) then
+                res = trim(int2s(len_trim(eval_expr_to_str(args(1)))))
+            else
+                res = '0'
+            end if
+            return
+
+        case ('upper')
+            if (argc >= 1) res = to_upper(trim(eval_expr_to_str(args(1))))
+            return
+
+        case ('lower')
+            if (argc >= 1) res = to_lower(trim(eval_expr_to_str(args(1))))
+            return
+
+        case ('substr')
+            ! substr(str, start, end)  — 1-based inclusive
+            if (argc >= 3) then
+                sv = trim(eval_expr_to_str(args(1)))
+                i   = nint(eval_num_expr_val(args(2)))
+                pe  = nint(eval_num_expr_val(args(3)))
+                if (i >= 1 .and. pe >= i .and. pe <= len_trim(sv)) then
+                    res = sv(i:pe)
+                else
+                    res = ''
+                end if
+            end if
+            return
+
+        case ('indexof')
+            ! indexof(str, substr)  — returns 0 if not found
+            if (argc >= 2) then
+                sv      = trim(eval_expr_to_str(args(1)))
+                fname_s = trim(eval_expr_to_str(args(2)))
+                res = trim(int2s(index(trim(sv), trim(fname_s))))
+            else
+                res = '0'
+            end if
+            return
+
+        case ('replace')
+            ! replace(str, old, new)
+            if (argc >= 3) then
+                res = str_replace(eval_expr_to_str(args(1)), &
+                                  eval_expr_to_str(args(2)), &
+                                  eval_expr_to_str(args(3)))
+            end if
+            return
+
+        case ('trim')
+            if (argc >= 1) res = trim(eval_expr_to_str(args(1)))
+            return
+
+        case ('arrlen','listlen')
+            if (argc >= 1) then
+                aidx = get_array_index(trim(eval_expr_to_str(args(1))))
+                if (aidx > 0) then
+                    res = trim(int2s(asize(aidx)))
+                else
+                    res = '0'
+                end if
+            else
+                res = '0'
+            end if
+            return
+
+        ! ---- Type casts ----
+        case ('int')
+            if (argc >= 1) then
+                rtmp = eval_num_expr_val(eval_expr_to_str(args(1)))
+                write(res,'(I0)') nint(rtmp)
+            else
+                res = '0'
+            end if
+            return
+
+        case ('float')
+            if (argc >= 1) then
+                rtmp = eval_num_expr_val(eval_expr_to_str(args(1)))
+                write(res,'(G0)') rtmp
+            else
+                res = '0.0'
+            end if
+            return
+
+        case ('str')
+            if (argc >= 1) then
+                res = trim(eval_expr_to_str(args(1)))
+            end if
+            return
+
+        case ('bool')
+            if (argc >= 1) then
+                sv = to_lower(trim(eval_expr_to_str(args(1))))
+                select case (sv)
+                case ('true','yes','1','t')
+                    res = 'true'
+                case ('false','no','0','f','')
+                    res = 'false'
+                case default
+                    rtmp = 0.0
+                    read(sv,*,err=801,end=801) rtmp
+801                 if (rtmp /= 0.0) then; res = 'true'; else; res = 'false'; end if
+                end select
+            else
+                res = 'false'
+            end if
+            return
+
+        end select
+
+        ! User-defined function
+        fidx = get_func_index(trim(fname_s))
+        if (fidx > 0) then
+            call invoke_func(fidx, args, argc, func_result)
+            res = trim(func_result)
+            return
+        end if
+
+        ! Unknown — return token as-is
+        res = ttrim
+        return
+    end if
+
+    ! Lookup variable
     do i = 1, vcount
         if (to_lower(trim(vname(i))) == tok_lower) then
             select case (to_lower(trim(vtype(i))))
@@ -994,23 +1845,15 @@ function resolve_value(tok) result(res)
                 res = trim(vval(i))
             case ('int','integer')
                 read(vval(i),*,err=901) itmp
-                write(res,'(I0)') itmp
-                return
-901             continue
-                res = 'Error: bad int value for '//trim(vname(i))
+                write(res,'(I0)') itmp; return
+901             res = 'Error: bad int for '//trim(vname(i))
             case ('float','floatation')
                 read(vval(i),*,err=902) rtmp
-                write(res,'(G0)') rtmp
-                return
-902             continue
-                res = 'Error: bad float value for '//trim(vname(i))
+                write(res,'(G0)') rtmp; return
+902             res = 'Error: bad float for '//trim(vname(i))
             case ('char','character')
-                s = trim(vval(i))
-                if (len_trim(s) >= 1) then
-                    res = s(1:1)
-                else
-                    res = '?'
-                end if
+                sv = trim(vval(i))
+                if (len_trim(sv) >= 1) then; res = sv(1:1); else; res = '?'; end if
             case ('bool','booleon')
                 res = trim(vval(i))
             case default
@@ -1020,10 +1863,11 @@ function resolve_value(tok) result(res)
         end if
     end do
 
-    ! fallback: return token text
+    ! Fallback
     res = ttrim
 end function
 
+! ================= NUMERIC UTILITIES =================
 function num_to_str(x, dp) result(s)
     real, intent(in) :: x
     integer, intent(in) :: dp
@@ -1041,19 +1885,17 @@ function num_to_str(x, dp) result(s)
     end if
 end function
 
-logical function is_string(s)
+function is_str_token(s) result(r)
     character(len=*), intent(in) :: s
+    logical :: r
     integer :: i
-    is_string = .false.
-    if (len_trim(s) >= 1) then
-        if (s(1:1) == '"') then
-            is_string = .true.
-            return
-        end if
-    end if
+    character(len=200) :: t
+    t = trim(lstrip_ws(s))
+    r = .false.
+    if (len_trim(t) >= 1 .and. t(1:1) == '"') then; r = .true.; return; end if
     do i = 1, vcount
-        if (to_lower(vname(i)) == to_lower(trim(s))) then
-            is_string = (vtype(i) == 'str')
+        if (to_lower(trim(vname(i))) == to_lower(trim(t))) then
+            r = (to_lower(trim(vtype(i))) == 'str' .or. to_lower(trim(vtype(i))) == 'string')
             return
         end if
     end do
@@ -1064,21 +1906,17 @@ function eval_str(s) result(r)
     character(len=200) :: r
     integer :: i
     if (len_trim(s) >= 1) then
-        if (s(1:1) == '"') then
-            r = strip_quotes(s)
-            return
-        end if
+        if (s(1:1) == '"') then; r = strip_quotes(s); return; end if
     end if
     do i = 1, vcount
         if (to_lower(vname(i)) == to_lower(trim(s))) then
-            r = vval(i)
-            return
+            r = vval(i); return
         end if
     end do
     r = trim(s)
 end function
 
-! ================= NUMERIC + BOOL =================
+! ================= NUMERIC + BOOL EXPRESSION EVALUATORS =================
 recursive subroutine eval_num_expr(expr, val, dp)
     character(len=*), intent(in) :: expr
     real,    intent(out) :: val
@@ -1090,76 +1928,58 @@ recursive subroutine eval_num_expr(expr, val, dp)
     integer :: idx
     character(len=200) :: left
 
-    dp = 0
-    val = 0.0
+    dp = 0; val = 0.0
     ex = trim(normalize_html(expr))
 
     if (index(ex,' + ') > 0) then
         p = index(ex,' + ')
         call eval_num_expr(trim(ex(:p-1)),vl,dpl)
         call eval_num_expr(trim(ex(p+3:)),vr,dpr)
-        val = vl + vr
-        dp = max(dpl,dpr)
-        return
+        val = vl + vr; dp = max(dpl,dpr); return
     end if
-
     if (index(ex,' - ') > 0) then
         p = index(ex,' - ')
         call eval_num_expr(trim(ex(:p-1)),vl,dpl)
         call eval_num_expr(trim(ex(p+3:)),vr,dpr)
-        val = vl - vr
-        dp = max(dpl,dpr)
-        return
+        val = vl - vr; dp = max(dpl,dpr); return
     end if
-
     if (index(ex,' * ') > 0) then
         p = index(ex,' * ')
         call eval_num_expr(trim(ex(:p-1)),vl,dpl)
         call eval_num_expr(trim(ex(p+3:)),vr,dpr)
-        val = vl * vr
-        dp = max(dpl,dpr)
-        return
+        val = vl * vr; dp = max(dpl,dpr); return
     end if
-
     if (index(ex,' / ') > 0) then
         p = index(ex,' / ')
         call eval_num_expr(trim(ex(:p-1)),vl,dpl)
         call eval_num_expr(trim(ex(p+3:)),vr,dpr)
-        val = vl / vr
-        dp = max(dpl,dpr)
-        return
+        if (vr == 0.0) then
+            call push_line(outbuf, outcount, 'Error: division by zero')
+            val = 0.0; dp = 0; return
+        end if
+        val = vl / vr; dp = max(dpl,dpr); return
     end if
-
-<<<<<<< HEAD
-    ! += is handled at the assignment level, not inside numeric expression eval
-    ! so we skip it here and fall through to get_val_dp
-=======
-<<<<<<< HEAD
-    ! += is handled at the assignment level, not inside numeric expression eval
-    ! so we skip it here and fall through to get_val_dp
-=======
-    if (index(ex, ' += ') > 0) then
-        p = index(ex, ' += ')
+    if (index(ex,' % ') > 0) then
+        p = index(ex,' % ')
+        call eval_num_expr(trim(ex(:p-1)),vl,dpl)
+        call eval_num_expr(trim(ex(p+3:)),vr,dpr)
+        val = real(mod(nint(vl), nint(vr))); dp = 0; return
+    end if
+    if (index(ex,' += ') > 0) then
+        p = index(ex,' += ')
         call eval_num_expr(trim(ex(p+4:)),vr,dpr)
         left = trim(ex(:p-1))
         idx = get_var_index(left)
         if (idx <= 0) then
             call push_line(outbuf, outcount, 'Error: variable '//trim(left)//' not found')
-            val = 0.0
-            dp = 0
-            return
+            val = 0.0; dp = 0; return
         end if
         read(vval(idx),*) vl
         vl = vl + vr
         write(vval(idx),*) vl
-        val = vl
-        dp = max(dp, dpr)
-        return
+        val = vl; dp = max(dp,dpr); return
     end if
->>>>>>> 521d9d61c24255c412b0f9c3b0500c46e958336b
->>>>>>> 9907cdcab7ad78e3e20eb753dacb85e6dd6a5bf9
-
-    call get_val_dp(ex,val,dp)
+    call get_val_dp(ex, val, dp)
 end subroutine
 
 recursive logical function eval_bool_expr(expr) result(res)
@@ -1169,33 +1989,34 @@ recursive logical function eval_bool_expr(expr) result(res)
 
     ex = trim(normalize_html(expr))
 
+    ! not operator
+    if (starts_with_keyword(trim(ex),'not ')) then
+        res = .not. eval_bool_expr(trim(lstrip_ws(ex(5:))))
+        return
+    end if
     if (index(to_lower(ex),' or ') > 0) then
         p = index(to_lower(ex),' or ')
-        l = trim(ex(:p-1))
-        r = trim(ex(p+4:))
-        res = eval_bool_expr(l) .or. eval_bool_expr(r)
-        return
+        l = trim(ex(:p-1)); r = trim(ex(p+4:))
+        res = eval_bool_expr(l) .or. eval_bool_expr(r); return
     end if
     if (index(to_lower(ex),' and ') > 0) then
         p = index(to_lower(ex),' and ')
-        l = trim(ex(:p-1))
-        r = trim(ex(p+5:))
-        res = eval_bool_expr(l) .and. eval_bool_expr(r)
-        return
+        l = trim(ex(:p-1)); r = trim(ex(p+5:))
+        res = eval_bool_expr(l) .and. eval_bool_expr(r); return
     end if
-
     res = eval_condition(ex)
 end function
 
 logical function eval_condition(expr) result(res)
     character(len=*), intent(in) :: expr
-    character(len=200) :: ex, l, r
-    integer :: p, oplen
+    character(len=200) :: ex, l, r, ls, rs
+    integer :: p, oplen, vi
     character(len=2) :: opk
 
     ex = trim(normalize_html(expr))
     res = .false.
     p = 0; oplen = 0; opk = '  '
+    ls = ''; rs = ''
 
     if (index(ex,'<=') > 0) then
         p = index(ex,'<='); oplen = 2; opk = 'LE'
@@ -1210,12 +2031,30 @@ logical function eval_condition(expr) result(res)
     else if (index(ex,'>') > 0) then
         p = index(ex,'>');  oplen = 1; opk = 'GT'
     else
-        res = .false.
+        ! No operator — bare boolean literal or variable
+        if (to_lower(trim(ex)) == 'true') then; res = .true.; return; end if
+        if (to_lower(trim(ex)) == 'false') then; res = .false.; return; end if
+        vi = get_var_index(trim(ex))
+        if (vi > 0) then
+            res = (to_lower(trim(vval(vi))) == 'true')
+        end if
         return
     end if
 
     l = trim(ex(:p-1))
     r = trim(ex(p+oplen:))
+
+    ! String comparison for == and !=
+    if ((opk == 'EQ' .or. opk == 'NE') .and. (is_str_token(l) .or. is_str_token(r))) then
+        ls = trim(resolve_value(trim(l)))
+        rs = trim(resolve_value(trim(r)))
+        if (opk == 'EQ') then
+            res = (trim(ls) == trim(rs))
+        else
+            res = (trim(ls) /= trim(rs))
+        end if
+        return
+    end if
 
     select case (opk)
     case ('LT'); res = (eval_num_expr_val(l) .lt. eval_num_expr_val(r))
@@ -1231,7 +2070,7 @@ recursive function eval_num_expr_val(expr) result(val)
     character(len=*), intent(in) :: expr
     real :: val
     integer :: dp
-    call eval_num_expr(expr,val,dp)
+    call eval_num_expr(expr, val, dp)
 end function
 
 subroutine get_val_dp(expr, val, dp)
@@ -1239,35 +2078,42 @@ subroutine get_val_dp(expr, val, dp)
     real,    intent(out) :: val
     integer, intent(out) :: dp
     integer :: idx
+    character(len=200) :: rv
+
     val = 0.0
     dp = 0
+
     idx = get_var_index(expr)
+
     if (idx > 0) then
         if (vtype(idx) == 'int') then
-            read(vval(idx),*) val
+            read(vval(idx),*,err=10,end=10) val
+            return
         else if (vtype(idx) == 'float') then
-            read(vval(idx),*) val
+            read(vval(idx),*,err=10,end=10) val
+            return
         else
             val = 0.0
         end if
     else
-        read(expr,*,err=100,end=100) val
+        read(expr,*,err=10,end=10) val
+        return
     end if
-100 continue
+
+10  continue   !Try resolve_value (func call, array elem, builtin)
+
+    rv = trim(resolve_value(expr))
+
+    if (trim(rv) /= trim(expr)) then
+        read(rv,*,err=20,end=20) val
+        return
+20      continue
+        val = 0.0
+    end if
+
 end subroutine
 
 ! ================= STRING EXPRESSION EVALUATOR =================
-! eval_str_expr: resolves a & / + concatenation expression to a string.
-!   &  adds a space between values  (like Python's join-with-space)
-!   +  concatenates without a space
-! Any token that is a known variable is resolved to its value.
-! Numeric variables are coerced to their display string.
-! String literals (single or double quoted) are unquoted.
-!
-! expr_has_str_op: returns .true. if the expression contains a bare
-! & or + that is outside quotes — meaning it is a string concat op.
-! This lets handle_assignment / store_variable decide which path to use.
-
 logical function expr_has_str_op(s)
     character(len=*), intent(in) :: s
     integer :: i, n
@@ -1277,23 +2123,17 @@ logical function expr_has_str_op(s)
     expr_has_str_op = .false.
     do i = 1, n
         if (.not. in_sq .and. .not. in_dq) then
-            if (s(i:i) == "'")  in_sq = .true.
-            if (s(i:i) == '"')  in_dq = .true.
+            if (s(i:i) == "'") in_sq = .true.
+            if (s(i:i) == '"') in_dq = .true.
             if (s(i:i) == '&' .or. s(i:i) == '+') then
-                ! Make sure it's not == or +=  (those are two-char ops)
                 if (i+1 <= n) then
-                    if (s(i+1:i+1) == '=' ) return  ! skip += or ==
+                    if (s(i+1:i+1) == '=') return
                 end if
-                ! Also skip numeric-only contexts: if there are NO variable
-                ! names in the expression, & and + are numeric ops, not string.
-                ! We rely on the caller (handle_assignment) to try numeric first
-                ! when no variables are found. Here we just say "yes, op present".
-                expr_has_str_op = .true.
-                return
+                expr_has_str_op = .true.; return
             end if
         else
-            if (in_sq .and. s(i:i) == "'")  in_sq = .false.
-            if (in_dq .and. s(i:i) == '"')  in_dq = .false.
+            if (in_sq .and. s(i:i) == "'") in_sq = .false.
+            if (in_dq .and. s(i:i) == '"') in_dq = .false.
         end if
     end do
 end function
@@ -1306,45 +2146,26 @@ function eval_str_expr(expr) result(res)
     character           :: op, last_op
     logical             :: first
 
-    rest     = trim(lstrip_ws(normalize_html(expr)))
-    res      = ''
-    first    = .true.
-    last_op  = char(0)
+    rest    = trim(lstrip_ws(normalize_html(expr)))
+    res     = ''
+    first   = .true.
+    last_op = char(0)
 
     do
         call next_token_and_op(rest, token_s, op)
         if (len_trim(token_s) == 0 .and. op == char(0)) exit
-
-        ! resolve the token: literal or variable
         piece = trim(resolve_value(token_s))
-
         if (.not. first) then
-            if (last_op == '&') then
-                ! & inserts a space between values
-                res = trim(res)//' '
-            end if
-            ! + just concatenates (no space)
+            if (last_op == '&') res = trim(res)//' '
         end if
-
         res   = trim(res)//trim(piece)
         first = .false.
-
         if (op == char(0)) exit
         last_op = op
     end do
 end function
 
 ! ================= READ =================
-! Supported syntaxes:
-!   read varname
-!   read varname, "prompt"
-!   read, "prompt"                      (prompt only, no capture)
-!   read type :: varname                (declare then read)
-!   read type :: varname, "prompt"      (declare then read with prompt)
-!
-! The prompt (if any) is printed to stdout immediately (no newline),
-! then the user's input is read on the next line.
-! User input is NOT echoed back or prefixed with ">>>".
 subroutine do_read(rest)
     character(len=*), intent(in) :: rest
     character(len=300) :: r, varname, prompt_str, typ, decl_part, after_decl
@@ -1352,22 +2173,17 @@ subroutine do_read(rest)
     integer :: comma_pos, dcolon_pos, idx
     logical :: has_prompt, is_decl
 
-    r          = trim(lstrip_ws(rest))
-    prompt_str = ''
-    varname    = ''
-    typ        = ''
-    has_prompt = .false.
-    is_decl    = .false.
+    r = trim(lstrip_ws(rest))
+    prompt_str = ''; varname = ''; typ = ''
+    has_prompt = .false.; is_decl = .false.
 
-    ! ── detect "type :: varname" declaration form ─────────────────────────────
-    dcolon_pos = index(r, '::')
+    dcolon_pos = index(r,'::')
     if (dcolon_pos > 0) then
-        is_decl    = .true.
-        decl_part  = trim(lstrip_ws(r(:dcolon_pos-1)))  ! e.g. "int"
-        after_decl = trim(lstrip_ws(r(dcolon_pos+2:)))  ! e.g. 'varname, "prompt"'
-        read(decl_part, '(A)') typ
+        is_decl   = .true.
+        decl_part = trim(lstrip_ws(r(:dcolon_pos-1)))
+        after_decl= trim(lstrip_ws(r(dcolon_pos+2:)))
+        read(decl_part,'(A)') typ
         typ = to_lower(trim(typ))
-        ! normalise type aliases to match vtype conventions
         select case (typ)
         case ('integer');    typ = 'int'
         case ('floatation'); typ = 'float'
@@ -1378,12 +2194,8 @@ subroutine do_read(rest)
         r = after_decl
     end if
 
-    ! ── split off optional prompt after comma ─────────────────────────────────
-    ! We look for the LAST comma that is outside quotes to be safe,
-    ! but a simple first-comma-outside-quotes is fine for read syntax.
     comma_pos = 0
     call find_comma_outside_quotes(r, comma_pos)
-
     if (comma_pos > 0) then
         varname    = trim(lstrip_ws(r(:comma_pos-1)))
         prompt_str = trim(lstrip_ws(r(comma_pos+1:)))
@@ -1391,28 +2203,17 @@ subroutine do_read(rest)
     else
         varname = trim(lstrip_ws(r))
     end if
+    if (has_prompt) prompt_str = strip_any_quotes(prompt_str)
 
-    ! strip quotes from prompt if present
-    if (has_prompt) then
-        prompt_str = strip_any_quotes(prompt_str)
-    end if
-
-    ! ── flush buffered output BEFORE the prompt so it appears in order ────────
     call flush_output(outbuf, outcount)
-
-    ! ── print prompt to stdout (no newline) ───────────────────────────────────
     if (has_prompt .and. len_trim(prompt_str) > 0) then
         write(*,'(A)') trim(prompt_str)
     end if
-
-    ! ── if varname is empty (bare "read, prompt") just return after prompt ────
     if (len_trim(varname) == 0) return
 
-    ! ── declare variable if this is a declaration form ────────────────────────
     if (is_decl) then
         idx = get_var_index(varname)
         if (idx <= 0) then
-            ! create with empty value
             if (vcount < MAXV) then
                 vcount = vcount + 1
                 vname(vcount) = trim(varname)
@@ -1420,25 +2221,21 @@ subroutine do_read(rest)
                 vval(vcount)  = ''
                 idx = vcount
             else
-                call push_line(outbuf, outcount, 'Error: variable table full')
-                return
+                call push_line(outbuf, outcount, 'Error: variable table full'); return
             end if
         else
             vtype(idx) = trim(typ)
         end if
     end if
 
-    ! ── read a line from stdin ────────────────────────────────────────────────
     read(*,'(A)', end=200) input_line
     input_line = trim(lstrip_ws(input_line))
     goto 201
 200 input_line = ''
 201 continue
 
-    ! ── store into variable ───────────────────────────────────────────────────
     idx = get_var_index(varname)
     if (idx <= 0) then
-        ! variable not declared — auto-create as str
         if (vcount < MAXV) then
             vcount = vcount + 1
             vname(vcount) = trim(varname)
@@ -1450,10 +2247,8 @@ subroutine do_read(rest)
         return
     end if
 
-    ! coerce to declared type
     select case (to_lower(trim(vtype(idx))))
     case ('int','integer')
-        ! validate it looks numeric; store as-is for int2s later
         vval(idx) = trim(input_line)
     case ('float','floatation','real')
         vval(idx) = trim(input_line)
@@ -1468,58 +2263,28 @@ subroutine do_read(rest)
         else
             vval(idx) = ''
         end if
-    case default   ! str / string
+    case default
         vval(idx) = trim(input_line)
     end select
 end subroutine
 
-! Helper: find position of first comma that is outside single or double quotes
-subroutine find_comma_outside_quotes(s, pos)
-    character(len=*), intent(in)  :: s
-    integer,          intent(out) :: pos
-    integer :: i, n
-    logical :: in_sq, in_dq
-    pos = 0; in_sq = .false.; in_dq = .false.
-    n = len_trim(s)
-    do i = 1, n
-        if (.not. in_sq .and. .not. in_dq) then
-            if (s(i:i) == "'")  in_sq = .true.
-            if (s(i:i) == '"')  in_dq = .true.
-            if (s(i:i) == ',')  then; pos = i; return; end if
-        else
-            if (in_sq .and. s(i:i) == "'")  in_sq = .false.
-            if (in_dq .and. s(i:i) == '"')  in_dq = .false.
-        end if
-    end do
-end subroutine
-
-! Helper: strip surrounding single or double quotes from a string
-function strip_any_quotes(s) result(o)
-    character(len=*),   intent(in) :: s
-    character(len=200) :: o
-    integer :: n
-    o = trim(s)
-    n = len_trim(o)
-    if (n >= 2) then
-        if ((o(1:1) == '"'  .and. o(n:n) == '"') .or. &
-            (o(1:1) == "'"  .and. o(n:n) == "'")) then
-            o = o(2:n-1)
-        end if
-    end if
-end function
-
 ! ================= END PROGRAM =================
 subroutine handle_end_prog(given_name)
     character(len=*), intent(in), optional :: given_name
-    ! Flush buffered program output to stdout — no extra noise lines
     call flush_output(outbuf, outcount)
-
-    vcount  = 0
-    outcount= 0
-    if_sp   = 0
-    loop_sp = 0
-    in_prog = .false.
-    current_prog_name = ''
+    vcount           = 0
+    outcount         = 0
+    if_sp            = 0
+    loop_sp          = 0
+    in_prog          = .false.
+    current_prog_name= ''
+    func_count       = 0
+    in_func_def      = .false.
+    current_func_idx = 0
+    func_def_nest    = 0
+    has_return       = .false.
+    return_value     = ''
+    acount           = 0
 end subroutine
 
 end program CLtranslator
