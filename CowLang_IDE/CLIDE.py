@@ -1,14 +1,8 @@
-"""
-CLIDE — CowLang Integrated Development Environment  v1.2.0
-===========================================================
-Requirements:  pip install customtkinter pillow
-Run:           python clide.py
-"""
-
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
-import threading, subprocess, re, time, platform, base64, io
+from tkinter import PhotoImage
+import threading, subprocess, re, time, platform, base64, io, json, os
 from pathlib import Path
 
 try:
@@ -19,7 +13,7 @@ except ImportError:
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-VERSION = "1.3.0"
+VERSION = "1.4.3"
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 BG          = "#0d1117"
@@ -110,8 +104,32 @@ INDENT = "  "
 
 DEFAULT_EXE = str(
     Path.home() / "CowLang" / "CowLang-main" / "CowLangTranslator" /
-    ("CLT_0.4.1.exe" if platform.system() == "Windows" else "CLT_0.4.1.elf")
+    ("CLT_0.4.2.exe" if platform.system() == "Windows" else "CLT_0.4.2.bin")
 )
+
+def _default_workspace_dir() -> Path:
+    home = Path.home()
+    for candidate in (
+        home / "Documents" / "CowLangFiles",
+        home / "documents" / "CowLangFiles",
+        home / "CowLangFiles",
+    ):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception:
+            continue
+    return home
+
+def _settings_dir() -> Path:
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "CLIDE"
+
+def _settings_path() -> Path:
+    return _settings_dir() / "settings.json"
+
+def _themes_path() -> Path:
+    return _settings_dir() / "themes.json"
 
 def _strip_comment(line: str) -> str:
     in_s = in_d = esc = False
@@ -123,6 +141,18 @@ def _strip_comment(line: str) -> str:
         if ch=="!" and not in_s and not in_d: return line[:i]
     return line
 
+# ── Dropdown Menu Management ──────────────────────────────────────────────────
+_active_dropdown_menu = None
+
+def _close_dropdown():
+    """Close any currently open dropdown menu"""
+    global _active_dropdown_menu
+    if _active_dropdown_menu:
+        try:
+            _active_dropdown_menu.unpost()
+        except:
+            pass
+        _active_dropdown_menu = None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Custom File Dialog
@@ -139,6 +169,8 @@ class CLIDEFileDialog(ctk.CTkToplevel):
         self._hist_idx   = 0
         self._entries    = []
         self._row_imgs   = []   # keep photo refs alive
+        self._active_menu = None
+        self._icon_cache = {}
 
         titles = {"open":"Open File","save":"Save As","dir":"Select Folder"}
         self.title(title or titles.get(mode,"Browse"))
@@ -359,15 +391,206 @@ class CLIDEFileDialog(ctk.CTkToplevel):
         self.destroy()
 
 def ask_open_file(parent,initial_dir=None):
-    return CLIDEFileDialog(parent,mode="open",initial_dir=initial_dir).result
+    """Open OS native file browser window for selecting files"""
+    import subprocess
+    import os
+    initial_dir = initial_dir or str(Path.home())
+    
+    try:
+        if platform.system() == "Darwin":  # macOS — use native file dialog
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application (path to frontmost application as text)\n'
+                 '  set chosen_file to choose file\n'
+                 '  if chosen_file is not false then\n'
+                 '    return POSIX path of chosen_file\n'
+                 '  end if\n'
+                 'end tell'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                path = result.stdout.strip()
+                if path and Path(path).exists():
+                    return path
+        
+        elif platform.system() == "Linux":
+            # Use zenity (available on most Linux distros with file managers)
+            # Suppress X11 notifications by redirecting stderr to devnull
+            result = subprocess.run(
+                ["zenity", "--file-selection", "--title=Open File",
+                 f"--filename={initial_dir}/"],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "NOTIFY_DISABLE": "1"}
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Windows":
+            # Use native Windows file dialog via PowerShell
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 '[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
+                 '$dialog = New-Object System.Windows.Forms.OpenFileDialog;'
+                 f'$dialog.InitialDirectory = "{initial_dir}";'
+                 '$dialog.Filter = "All files (*.*)|*.*|CowLang (*.cow; *.cl; *.cowp; *.clp; *.ox)|*.cow;*.cl;*.cowp;*.clp;*.ox";'
+                 'if ($dialog.ShowDialog() -eq "OK") { Write-Host $dialog.FileName }'],
+                capture_output=True, text=True, timeout=30,
+                stderr=subprocess.DEVNULL
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    except Exception as e:
+        pass
+    
+    return None
+
 def ask_save_file(parent,initial_dir=None,default_ext=".cow",initial_file=""):
-    return CLIDEFileDialog(parent,mode="save",initial_dir=initial_dir,
-                           default_ext=default_ext,initial_file=initial_file).result
+    """Open OS native file browser window for saving files"""
+    import subprocess
+    import os
+    initial_dir = initial_dir or str(Path.home())
+    
+    try:
+        if platform.system() == "Darwin":  # macOS
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application (path to frontmost application as text)\n'
+                 f'  set chosen_file to choose file name with prompt "Save file:" default name "{initial_file}"\n'
+                 '  if chosen_file is not false then\n'
+                 '    return POSIX path of chosen_file\n'
+                 '  end if\n'
+                 'end tell'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Linux":
+            result = subprocess.run(
+                ["zenity", "--file-selection", "--save", "--title=Save File",
+                 f"--filename={initial_dir}/{initial_file}"],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "NOTIFY_DISABLE": "1"}
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Windows":
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 '[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
+                 '$dialog = New-Object System.Windows.Forms.SaveFileDialog;'
+                 f'$dialog.InitialDirectory = "{initial_dir}";'
+                 f'$dialog.FileName = "{initial_file}";'
+                 '$dialog.Filter = "CowLang (*.cow; *.cl; *.cowp; *.clp; *.ox)|*.cow;*.cl;*.cowp;*.clp;*.ox|All files (*.*)|*.*";'
+                 'if ($dialog.ShowDialog() -eq "OK") { Write-Host $dialog.FileName }'],
+                capture_output=True, text=True, timeout=30,
+                stderr=subprocess.DEVNULL
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    except Exception as e:
+        pass
+    
+    return None
+
 def ask_directory(parent,initial_dir=None):
-    return CLIDEFileDialog(parent,mode="dir",initial_dir=initial_dir).result
+    """Open OS native folder browser window for selecting directories"""
+    import subprocess
+    import os
+    initial_dir = initial_dir or str(Path.home())
+    
+    try:
+        if platform.system() == "Darwin":  # macOS
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application (path to frontmost application as text)\n'
+                 '  set chosen_folder to choose folder\n'
+                 '  if chosen_folder is not false then\n'
+                 '    return POSIX path of chosen_folder\n'
+                 '  end if\n'
+                 'end tell'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Linux":
+            # Try zenity first
+            result = subprocess.run(
+                ["zenity", "--file-selection", "--directory", "--title=Open Folder",
+                 f"--filename={initial_dir}/"],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "NOTIFY_DISABLE": "1"}
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Windows":
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 '[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
+                 '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;'
+                 f'$dialog.SelectedPath = "{initial_dir}";'
+                 'if ($dialog.ShowDialog() -eq "OK") { Write-Host $dialog.SelectedPath }'],
+                capture_output=True, text=True, timeout=30,
+                stderr=subprocess.DEVNULL
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    except Exception as e:
+        pass
+    
+    return None
+
 def ask_open_exe(parent,initial_dir=None):
-    return CLIDEFileDialog(parent,mode="open",title="Select CowLang Translator",
-                           initial_dir=initial_dir or str(Path.home())).result
+    """Open OS native file browser for selecting executables"""
+    import subprocess
+    import os
+    initial_dir = initial_dir or str(Path.home())
+    
+    try:
+        if platform.system() == "Darwin":  # macOS
+            result = subprocess.run(
+                ["osascript", "-e",
+                 'tell application (path to frontmost application as text)\n'
+                 '  set chosen_file to choose file with prompt "Select CowLang Translator:"\n'
+                 '  if chosen_file is not false then\n'
+                 '    return POSIX path of chosen_file\n'
+                 '  end if\n'
+                 'end tell'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Linux":
+            result = subprocess.run(
+                ["zenity", "--file-selection", "--title=Select Translator",
+                 f"--filename={initial_dir}/"],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "NOTIFY_DISABLE": "1"}
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        
+        elif platform.system() == "Windows":
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 '[System.Reflection.Assembly]::LoadWithPartialName("System.windows.forms") | Out-Null;'
+                 '$dialog = New-Object System.Windows.Forms.OpenFileDialog;'
+                 f'$dialog.InitialDirectory = "{initial_dir}";'
+                 '$dialog.Filter = "Executables (*.exe; *.bin; *.bat)|*.exe;*.bin;*.bat|All files (*.*)|*.*";'
+                 'if ($dialog.ShowDialog() -eq "OK") { Write-Host $dialog.FileName }'],
+                capture_output=True, text=True, timeout=30,
+                stderr=subprocess.DEVNULL
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+    except Exception as e:
+        pass
+    
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -398,64 +621,220 @@ class AutoComplete(tk.Toplevel):
 #  File Browser Sidebar
 # ═══════════════════════════════════════════════════════════════════════════════
 class FileBrowser(ctk.CTkFrame):
-    def __init__(self,parent,on_open,**kw):
+    def __init__(self,parent,on_open,root_path=None,**kw):
         super().__init__(parent,fg_color=PANEL,**kw)
         self.on_open=on_open
-        self._root_path=Path.home()
-        self._entries=[]
-
-        hdr=ctk.CTkFrame(self,fg_color="#21262d",corner_radius=0,height=30)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        ctk.CTkLabel(hdr,text="EXPLORER",font=ctk.CTkFont("Courier New",10,"bold"),
-                     text_color=MUTED).pack(side="left",padx=8)
-        ctk.CTkButton(hdr,text="⟳",width=24,height=24,fg_color="transparent",
-                      hover_color="#30363d",font=ctk.CTkFont("Courier New",12),
-                      text_color=MUTED,command=self.refresh).pack(side="right",padx=4)
-        ctk.CTkButton(hdr,text="📁",width=24,height=24,fg_color="transparent",
-                      hover_color="#30363d",font=ctk.CTkFont("Courier New",12),
-                      text_color=MUTED,command=self._browse_dir).pack(side="right")
+        self._root_path=Path(root_path) if root_path else _default_workspace_dir()
+        try:
+            self._root_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self._path_var=ctk.StringVar(value=str(self._root_path))
-        ctk.CTkLabel(self,textvariable=self._path_var,font=ctk.CTkFont("Courier New",9),
-                     text_color=MUTED,wraplength=170,anchor="w").pack(fill="x",padx=6,pady=2)
-        self._lb=tk.Listbox(self,bg=PANEL,fg=TEXT,selectbackground=ACCENT2,selectforeground=BG,
-            font=("Courier New",11),relief="flat",bd=0,activestyle="none",
-            exportselection=False,highlightthickness=0)
-        self._lb.pack(fill="both",expand=True)
-        self._lb.bind("<Double-Button-1>",self._on_select)
-        self._lb.bind("<Return>",self._on_select)
+        self._node_map = {}  # Maps tree item IDs to Path objects
+
+        # ── Header with folder name and buttons ──────────────────────────────
+        hdr=ctk.CTkFrame(self,fg_color="#21262d",corner_radius=0,height=40)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        
+        hdr_left = ctk.CTkFrame(hdr, fg_color="#21262d")
+        hdr_left.pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        
+        ctk.CTkLabel(hdr_left, text="EXPLORER", 
+                     font=ctk.CTkFont("Courier New", 10, "bold"),
+                     text_color=MUTED).pack(side="left", anchor="w")
+        
+        # Current folder path (smaller, below EXPLORER)
+        path_lbl = ctk.CTkLabel(hdr_left, textvariable=self._path_var,
+                                font=ctk.CTkFont("Courier New", 8),
+                                text_color="#8b949e")
+        path_lbl.pack(side="left", anchor="w", pady=(2,0))
+        
+        hdr_right = ctk.CTkFrame(hdr, fg_color="#21262d")
+        hdr_right.pack(side="right", padx=4, pady=8)
+        
+        ctk.CTkButton(hdr_right, text="📁", width=24, height=24, 
+                      fg_color="transparent", hover_color="#30363d",
+                      font=ctk.CTkFont("Courier New", 12),
+                      text_color=MUTED, command=self._browse_dir).pack(side="left", padx=2)
+        ctk.CTkButton(hdr_right, text="⟳", width=24, height=24,
+                      fg_color="transparent", hover_color="#30363d",
+                      font=ctk.CTkFont("Courier New", 12),
+                      text_color=MUTED, command=self.refresh).pack(side="left", padx=2)
+
+        # ── Tree view for folder hierarchy (like VS Code) ──────────────────────
+        from tkinter import ttk
+        
+        # Style the treeview to match VS Code
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Treeview", 
+                       background=PANEL, 
+                       foreground=TEXT,
+                       fieldbackground=PANEL,
+                       font=("Courier New", 10),
+                       rowheight=20,
+                       relief="flat",
+                       bd=0)
+        style.configure("Treeview.Heading", background="#21262d", foreground=MUTED)
+        style.map("Treeview", 
+                 background=[('selected', ACCENT2)])
+        
+        self._tree = ttk.Treeview(self, style="Treeview", height=25)
+        self._tree.pack(fill="both", expand=True, padx=0, pady=0)
+        
+        # Bind events
+        self._tree.bind("<Double-1>", self._on_select)
+        self._tree.bind("<Return>", self._on_select)
+        self._tree.bind("<<TreeviewOpen>>", self._on_expand)
+        
+        # Hide the # column (row numbers)
+        self._tree['show'] = 'tree'
+        
         self.refresh()
 
-    def set_dir(self,path):
-        p=Path(path); d=p.parent if p.is_file() else p
+    def set_dir(self, path):
+        p = Path(path)
+        d = p.parent if p.is_file() else p
         if d.is_dir():
-            self._root_path=d; self._path_var.set(str(d)); self.refresh()
+            self._root_path = d
+            self._path_var.set(str(d))
+            self.refresh()
+
     def _browse_dir(self):
-        d=ask_directory(self.winfo_toplevel(),str(self._root_path))
-        if d: self.set_dir(d)
-    def refresh(self,_=None):
-        self._lb.delete(0,"end"); self._entries=[]
+        d = ask_directory(self.winfo_toplevel(), str(self._root_path))
+        if d:
+            self.set_dir(d)
+
+    def _get_icon(self, path):
+        if path.is_dir():
+            return ""  # no emoji, let tree handle folder icon
+
+        ext = path.suffix.lower()
+
+        # 🐄 CowLang files
+        if ext in CL_EXTS:
+            return "🐄 "
+        
+        # Common code file types
+        elif ext in {'.py', '.js', '.java', '.cpp', '.c', '.h', '.go', '.rs', '.rb', '.php'}:
+            return "⚙️  "
+        
+        # Document/config files
+        elif ext in {'.txt', '.md', '.json', '.yaml', '.yml', '.toml', '.xml', '.html', '.css', '.csv'}:
+            return "📄 "
+        
+        # Default: paper with text emoji for unknown types
+        else:
+            return "📝 "
+
+    def _path_to_id(self, path):
+        """Convert Path to a unique ID for tree items"""
+        return str(path).replace(str(self._root_path), "root")
+
+    def _id_to_path(self, item_id):
+        """Convert tree item ID back to Path"""
+        if item_id in self._node_map:
+            return self._node_map[item_id]
+        return None
+
+    def refresh(self, _=None):
+        """Refresh the tree view"""
+        self._tree.delete(*self._tree.get_children())
+        self._node_map.clear()
+        
+        # Add root folder
+        root_id = self._tree.insert("", "end", "root", 
+                                    text=f" {self._root_path.name}",
+                                    open=True)
+        self._node_map["root"] = self._root_path
+        
+        # Populate children of root
+        self._populate_dir("root", self._root_path)
+
+    def _populate_dir(self, parent_id, dir_path):
+        """Recursively populate tree items for a directory"""
         try:
-            entries=sorted(self._root_path.iterdir(),key=lambda p:(p.is_file(),p.name.lower()))
-            for e in entries:
-                if e.name.startswith("."): continue
-                ext=e.suffix.lower() if e.is_file() else ""
-                if ext==".cow":   icon="🐄 "
-                elif ext==".cl":  icon="🐄 "
-                elif ext in CL_EXTS: icon="🐄 "
-                elif e.is_dir():  icon="📁 "
-                else:             icon="📄 "
-                self._lb.insert("end",f"  {icon}{e.name}")
-                color=ACCENT if (e.is_file() and e.suffix.lower() in CL_EXTS) else \
-                      ACCENT2 if e.is_dir() else TEXT
-                self._lb.itemconfig(len(self._entries),fg=color)
-                self._entries.append(e)
-        except PermissionError: pass
-    def _on_select(self,_=None):
-        sel=self._lb.curselection()
-        if not sel: return
-        e=self._entries[sel[0]]
-        if e.is_dir(): self.set_dir(str(e))
-        else:          self.on_open(str(e))
+            entries = sorted(dir_path.iterdir(), 
+                            key=lambda p: (p.is_file(), p.name.lower()))
+            
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                
+                item_id = self._path_to_id(entry)
+                
+                if entry.is_dir():
+                    icon = "🗀 "  # folder icon
+                    
+                    text = f"{icon}{entry.name}"
+                    node_id = self._tree.insert(parent_id, "end",
+                                                text=text,
+                                                open=False,
+                                                values=[str(entry)])
+                    
+                    self._node_map[node_id] = entry
+
+                    # dummy child so arrow shows
+                    self._tree.insert(node_id, "end", text="(loading...)")
+
+                else:
+                    icon = self._get_icon(entry)
+                    color = ACCENT if entry.suffix.lower() in CL_EXTS else TEXT
+                    text = f"{icon}{entry.name}"
+                    
+                    node_id = self._tree.insert(parent_id, "end",
+                                                text=text,
+                                                values=[str(entry)])
+                    
+                    self._node_map[node_id] = entry
+
+                    # Color the item
+                    self._tree.tag_configure(f"color_{node_id}", foreground=color)
+                    self._tree.item(node_id, tags=[f"color_{node_id}"])
+        
+        except (PermissionError, OSError):
+            pass
+
+    def _on_expand(self, event=None):
+        """Handle folder expansion (lazy loading)"""
+        item = self._tree.focus()  # IMPORTANT: use focused item, not selection
+
+        path = self._node_map.get(item)
+        if not path or not path.is_dir():
+            return
+
+        children = self._tree.get_children(item)
+
+        # check for dummy
+        if children:
+            first = children[0]
+            if self._tree.item(first, "text").startswith("(loading"):
+                # remove dummy
+                self._tree.delete(*children)
+
+                # populate real contents
+                self._populate_dir(item, path)
+
+    def _on_select(self, _=None):
+        """Handle file/folder selection"""
+        selection = self._tree.selection()
+        if not selection:
+            return
+        
+        item_id = selection[0]
+        path = self._id_to_path(item_id)
+        
+        if not path:
+            return
+        
+        if path.is_dir():
+            # Expand/collapse folder
+            is_open = self._tree.item(item_id, "open")
+            self._tree.item(item_id, open=not is_open)
+            self._on_expand()
+        else:
+            # Open file
+            self.on_open(str(path))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -466,8 +845,21 @@ class EditorTab:
         self.path=path; self.content=""; self.modified=False
     @property
     def display_name(self):
-        base=Path(self.path).name if self.path else "untitled"
-        return ("● "+base) if self.modified else base
+        base = Path(self.path).name if self.path else "untitled"
+
+        # get icon (fallback if no path)
+        if self.path:
+            ext = Path(self.path).suffix.lower()
+            if ext in [".cow", ".cl", ".cowp", ".clp", ".ox"]:
+                icon = "🐄 "
+            else:
+                icon = "📄 "
+        else:
+            icon = "📄 "
+
+        name = f"{icon}{base}"
+
+        return ("● " + name) if self.modified else name
     @property
     def ext(self):
         return Path(self.path).suffix.lower() if self.path else ""
@@ -488,19 +880,31 @@ class TabBar(tk.Frame):
         self._active = -1
         self._frames = []
         self._drag_from = None
+        self._redraw_pending = False  # Flag to batch redraws
 
     def add_tab(self,tab):
-        idx=len(self._tabs); self._tabs.append(tab); self._redraw(); return idx
+        idx=len(self._tabs); self._tabs.append(tab); self._schedule_redraw(); return idx
     def remove_tab(self,idx):
         if 0<=idx<len(self._tabs):
             self._tabs.pop(idx)
             if self._active>=len(self._tabs): self._active=max(0,len(self._tabs)-1)
-            self._redraw()
+            self._schedule_redraw()
     def set_active(self,idx):
-        self._active=idx; self._redraw()
+        self._active=idx; self._schedule_redraw()
     def mark_modified(self,idx,v):
         if 0<=idx<len(self._tabs):
-            self._tabs[idx].modified=v; self._redraw()
+            self._tabs[idx].modified=v; self._schedule_redraw()
+    
+    def _schedule_redraw(self):
+        """Schedule a redraw on the next idle cycle to batch updates and prevent flicker"""
+        if not self._redraw_pending:
+            self._redraw_pending = True
+            self.after_idle(self._do_redraw)
+    
+    def _do_redraw(self):
+        """Actual redraw implementation"""
+        self._redraw_pending = False
+        self._redraw()
 
     def _tab_index_at(self, x):
         """Return the tab index whose frame contains screen-x."""
@@ -548,6 +952,12 @@ class TabBar(tk.Frame):
             x_btn.bind("<Enter>",     lambda e,l=x_btn: l.configure(fg=DANGER))
             x_btn.bind("<Leave>",     lambda e,l=x_btn: l.configure(fg=MUTED))
             self._frames.append(frm)
+        
+        # Force X11 repaint to prevent rendering glitches
+        try:
+            self.update_idletasks()
+        except:
+            pass
 
     def _on_press(self,event,idx):
         self._drag_from=idx
@@ -644,47 +1054,82 @@ class EditorPanel(tk.Frame):
             t.tag_lower(tag, "comment")
 
     def highlight(self):
-        t    = self.text
-        text = t.get("1.0","end")
+        """Optimized highlighting: only highlight visible lines + buffer (like VS Code)"""
+        t = self.text
+        
+        # For small files (<50KB), highlight everything
+        # For large files, only highlight visible range + buffer
+        text = t.get("1.0", "end")
+        file_size = len(text)
+        
+        if file_size > 50000:  # Large file optimization
+            # Get visible line range
+            try:
+                first_visible = t.index("@0,0")
+                last_visible = t.index("@0,+10000c")  # ~visible window
+                first_line = int(first_visible.split(".")[0])
+                last_line = int(last_visible.split(".")[0])
+                
+                # Add buffer (highlight lines before and after visible)
+                buffer_lines = 50
+                start_line = max(1, first_line - buffer_lines)
+                end_line = min(len(text.splitlines()), last_line + buffer_lines)
+                
+                # Get just the portion to highlight
+                lines = text.splitlines(True)
+                highlight_start = start_line - 1
+                highlight_end = min(end_line, len(lines))
+                
+                # Only highlight visible portion
+                partial_text = "".join(lines[highlight_start:highlight_end])
+                start_offset = len("".join(lines[:highlight_start]))
+            except:
+                # Fallback to full file if visible range calc fails
+                partial_text = text
+                start_offset = 0
+        else:
+            partial_text = text
+            start_offset = 0
 
-        # Clear all tags first
-        for tag in ("keyword","type","string","comment","number",
-                    "operator","dcolon","language"):
-            t.tag_remove(tag,"1.0","end")
+        # Clear relevant tags in the highlight region
+        if file_size > 50000:
+            try:
+                for tag in ("keyword","type","string","comment","number",
+                            "operator","dcolon","language"):
+                    start_idx = f"1.0+{start_offset}c"
+                    end_idx = f"1.0+{start_offset + len(partial_text)}c"
+                    t.tag_remove(tag, start_idx, end_idx)
+            except:
+                pass
+        else:
+            for tag in ("keyword","type","string","comment","number",
+                        "operator","dcolon","language"):
+                t.tag_remove(tag,"1.0","end")
 
-        # ── First pass: strings, comments, :: ──────────────────────────────
-        # We track exact character spans so later passes can avoid them.
-        # string_spans and comment_spans are lists of (start_char, end_char)
-        # in absolute char-offset space.
-        string_spans  = []   # ranges that are inside a string literal
-        comment_spans = []   # ranges that are comments
+        # ── First pass: strings and comments ────────────────────────────────
+        string_spans  = []
+        comment_spans = []
 
-        offset = 0
-        for line in text.splitlines(True):
+        offset = start_offset
+        for line in partial_text.splitlines(True):
             line_len = len(line)
-            # --- comment detection (everything after unquoted !) ---
             cp = _strip_comment(line)
             cs = len(cp)
             if cs < line_len:
-                # colour from ! to end of line (excluding the \n itself is fine)
                 t.tag_add("comment",
                           f"1.0+{offset+cs}c",
                           f"1.0+{offset+line_len}c")
                 comment_spans.append((offset+cs, offset+line_len))
 
-            # --- string detection within the code portion ---
-            # double-quoted strings extend to end of line if unclosed
-            # single-quoted strings also extend to end of line if unclosed
             i = 0
             while i < cs:
                 ch = line[i]
                 if ch == '"':
-                    # find closing " on same line, or colour to EOL
                     j = i + 1
                     while j < cs:
                         if line[j] == '"': break
                         j += 1
-                    end = j + 1 if j < cs else cs  # include closing quote if found
+                    end = j + 1 if j < cs else cs
                     t.tag_add("string",
                               f"1.0+{offset+i}c",
                               f"1.0+{offset+end}c")
@@ -707,7 +1152,6 @@ class EditorPanel(tk.Frame):
 
             offset += line_len
 
-        # Helper: is absolute char position inside a string or comment?
         def _in_protected(pos, end_pos=None):
             ep = end_pos if end_pos is not None else pos+1
             for s,e in string_spans:
@@ -716,42 +1160,42 @@ class EditorPanel(tk.Frame):
                 if pos < e and ep > s: return True
             return False
 
-        # ── Second pass: :: (dcolon) ────────────────────────────────────────
-        for m in re.finditer(r"::", text):
-            if not _in_protected(m.start(), m.end()):
-                t.tag_add("dcolon", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        # ── Remaining passes (optimized for partial text) ──────────────────────
+        # Second pass: ::
+        for m in re.finditer(r"::", partial_text):
+            if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                t.tag_add("dcolon", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Third pass: numbers ─────────────────────────────────────────────
-        for m in re.finditer(r"\b\d+(\.\d+)?\b", text):
-            if not _in_protected(m.start(), m.end()):
-                t.tag_add("number", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        # Third pass: numbers
+        for m in re.finditer(r"\b\d+(\.\d+)?\b", partial_text):
+            if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                t.tag_add("number", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Fourth pass: operators (excluding :: which has its own colour) ──
-        # Pattern excludes :: by using a negative-lookahead/behind approach
+        # Fourth pass: operators
         op_pat = re.compile(r"(?<!:):(?!:)|==|!=|<=|>=|<(?!=)|>(?!=)|\+(?!=)|-(?!=)|\*|/(?!/)|(?<!:=)=(?!=)")
-        for m in op_pat.finditer(text):
-            if not _in_protected(m.start(), m.end()):
-                t.tag_add("operator", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in op_pat.finditer(partial_text):
+            if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                t.tag_add("operator", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Fifth pass: language tokens ─────────────────────────────────────
+        # Fifth pass: language tokens
         lp = r"\b(" + "|".join(re.escape(x) for x in LANG_TOKENS) + r")\b"
-        for m in re.finditer(lp, text, re.IGNORECASE):
-            if not _in_protected(m.start(), m.end()):
-                t.tag_add("language", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in re.finditer(lp, partial_text, re.IGNORECASE):
+            if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                t.tag_add("language", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Sixth pass: types ───────────────────────────────────────────────
+        # Sixth pass: types
         tp = r"\b(" + "|".join(re.escape(x) for x in TYPES) + r")\b"
-        for m in re.finditer(tp, text, re.IGNORECASE):
-            if not _in_protected(m.start(), m.end()):
-                t.tag_add("type", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in re.finditer(tp, partial_text, re.IGNORECASE):
+            if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                t.tag_add("type", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Seventh pass: keywords (longest first) ──────────────────────────
+        # Seventh pass: keywords
         for kw in sorted(KEYWORDS, key=lambda k: -len(k)):
-            for m in re.finditer(rf"\b{re.escape(kw)}\b", text, re.IGNORECASE):
-                if not _in_protected(m.start(), m.end()):
-                    t.tag_add("keyword", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+            for m in re.finditer(rf"\b{re.escape(kw)}\b", partial_text, re.IGNORECASE):
+                if not _in_protected(start_offset + m.start(), start_offset + m.end()):
+                    t.tag_add("keyword", f"1.0+{start_offset+m.start()}c", f"1.0+{start_offset+m.end()}c")
 
-        # ── Current line highlight ──────────────────────────────────────────
+        # Current line highlight
         t.tag_remove("current_line","1.0","end")
         ln = t.index("insert").split(".")[0]
         t.tag_add("current_line", f"{ln}.0", f"{ln}.0 lineend+1c")
@@ -768,6 +1212,94 @@ class EditorPanel(tk.Frame):
     def get_content(self) -> str:
         return self.text.get("1.0","end-1c")
 
+
+# ── Colour key list (used by theme editor) ───────────────────────────────────
+COLOUR_KEYS = [
+    ("BG",          "Background"),
+    ("PANEL",       "Panel / toolbar"),
+    ("TERMINAL_BG", "Terminal background"),
+    ("TAB_BG",      "Tab bar background"),
+    ("TAB_ACTIVE",  "Active tab background"),
+    ("TEXT",        "Primary text"),
+    ("MUTED",       "Muted / secondary text"),
+    ("ACCENT",      "Accent (green / run)"),
+    ("ACCENT2",     "Accent 2 (blue / links)"),
+    ("WARN",        "Warning colour"),
+    ("DANGER",      "Danger / error colour"),
+    ("BORDER",      "Border colour"),
+    ("SYN_KW",      "Syntax: keywords"),
+    ("SYN_TYPE",    "Syntax: types"),
+    ("SYN_STR",     "Syntax: strings"),
+    ("SYN_CMNT",    "Syntax: comments"),
+    ("SYN_NUM",     "Syntax: numbers"),
+    ("SYN_LANG",    "Syntax: language tokens"),
+]
+
+# Built-in themes
+_BUILTIN_THEMES = {
+    "CLIDE Dark (default)": {
+        "BG":"#0d1117","PANEL":"#161b22","TERMINAL_BG":"#090c10",
+        "TAB_BG":"#010409","TAB_ACTIVE":"#0d1117",
+        "TEXT":"#e6edf3","MUTED":"#8b949e",
+        "ACCENT":"#39d353","ACCENT2":"#58a6ff",
+        "WARN":"#e3b341","DANGER":"#f85149","BORDER":"#30363d",
+        "SYN_KW":"#ff7b72","SYN_TYPE":"#79c0ff","SYN_STR":"#a5d6ff",
+        "SYN_CMNT":"#8b949e","SYN_NUM":"#f2cc60","SYN_LANG":"#d2a8ff",
+    },
+    "CLIDE Light": {
+        "BG":"#ffffff","PANEL":"#f6f8fa","TERMINAL_BG":"#f0f0f0",
+        "TAB_BG":"#eaeef2","TAB_ACTIVE":"#ffffff",
+        "TEXT":"#24292f","MUTED":"#57606a",
+        "ACCENT":"#1a7f37","ACCENT2":"#0969da",
+        "WARN":"#9a6700","DANGER":"#cf222e","BORDER":"#d0d7de",
+        "SYN_KW":"#cf222e","SYN_TYPE":"#0550ae","SYN_STR":"#0a3069",
+        "SYN_CMNT":"#57606a","SYN_NUM":"#953800","SYN_LANG":"#8250df",
+    },
+    "Monokai": {
+        "BG":"#272822","PANEL":"#1e1f1c","TERMINAL_BG":"#1a1b18",
+        "TAB_BG":"#1e1f1c","TAB_ACTIVE":"#272822",
+        "TEXT":"#f8f8f2","MUTED":"#75715e",
+        "ACCENT":"#a6e22e","ACCENT2":"#66d9e8",
+        "WARN":"#e6db74","DANGER":"#f92672","BORDER":"#3e3d32",
+        "SYN_KW":"#f92672","SYN_TYPE":"#66d9e8","SYN_STR":"#e6db74",
+        "SYN_CMNT":"#75715e","SYN_NUM":"#ae81ff","SYN_LANG":"#a6e22e",
+    },
+    "Solarized Dark": {
+        "BG":"#002b36","PANEL":"#073642","TERMINAL_BG":"#001e26",
+        "TAB_BG":"#073642","TAB_ACTIVE":"#002b36",
+        "TEXT":"#839496","MUTED":"#586e75",
+        "ACCENT":"#859900","ACCENT2":"#268bd2",
+        "WARN":"#b58900","DANGER":"#dc322f","BORDER":"#073642",
+        "SYN_KW":"#859900","SYN_TYPE":"#268bd2","SYN_STR":"#2aa198",
+        "SYN_CMNT":"#586e75","SYN_NUM":"#d33682","SYN_LANG":"#6c71c4",
+    },
+}
+
+def _load_custom_themes() -> dict:
+    try:
+        p = _themes_path()
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception: pass
+    return {}
+
+def _save_custom_themes(themes: dict):
+    try:
+        sd = _settings_dir(); sd.mkdir(parents=True, exist_ok=True)
+        _themes_path().write_text(json.dumps(themes, indent=2), encoding="utf-8")
+    except Exception: pass
+
+def _all_themes() -> dict:
+    """Built-ins first, then custom (custom can override built-in names)."""
+    t = dict(_BUILTIN_THEMES)
+    t.update(_load_custom_themes())
+    return t
+
+def _apply_colour_dict(d: dict):
+    """Write a colour dict into the global colour variables."""
+    g = globals()
+    for k, v in d.items():
+        if k in g: g[k] = v
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main IDE
@@ -790,9 +1322,14 @@ class CLIDE(ctk.CTk):
         self._term_height   = 200
         self._split         = False
         self._split_idx     = -1
-        self._last_save_dir = str(Path.home())
+        self._workspace_dir = _default_workspace_dir()
+        self._last_save_dir = str(self._workspace_dir)
         self._running_proc  = None
+        self._settings_win  = None
+        self._theme         = "dark"
+        self._colour_theme  = "CLIDE Dark (default)"
 
+        self._load_settings()
         self._build_ui()
         self._apply_keybindings()
         self._schedule_autosave()
@@ -810,9 +1347,87 @@ class CLIDE(ctk.CTk):
         return self._main_panel.text
 
     # ── Settings ─────────────────────────────────────────────────────────────
-    def _load_settings(self): pass
+    def _load_settings(self):
+        self._workspace_dir = getattr(self, "_workspace_dir", _default_workspace_dir())
+        self._workspace_dir.mkdir(parents=True, exist_ok=True)
 
-    def _save_settings(self): pass
+        settings = {}
+        try:
+            sp = _settings_path()
+            if sp.exists():
+                settings = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            settings = {}
+
+        self.autosave = bool(settings.get("autosave", self.autosave))
+        #self._cowlang_exe = settings.get("cowlang_exe", self._cowlang_exe)
+        self._last_save_dir = settings.get("last_save_dir", self._last_save_dir)
+        
+        # Don't restore workspace dir on startup — let user pick via file explorer
+        # But keep the setting saved for reference if needed
+        # ws = settings.get("workspace_dir")
+        # if ws:
+        #     try:
+        #         self._workspace_dir = Path(ws).expanduser()
+        #         self._workspace_dir.mkdir(parents=True, exist_ok=True)
+        #     except Exception:
+        #         pass
+
+        # Theme
+        self._theme = settings.get("theme", "dark")
+        ctk.set_appearance_mode(self._theme)
+
+        # Active colour theme
+        self._colour_theme = settings.get("colour_theme", "CLIDE Dark (default)")
+        themes = _all_themes()
+        if self._colour_theme in themes:
+            _apply_colour_dict(themes[self._colour_theme])
+
+        # Custom file extensions
+        saved_exts = settings.get("cl_exts")
+        if isinstance(saved_exts, list) and saved_exts:
+            CL_EXTS.clear()
+            CL_EXTS.update(saved_exts)
+
+        recent = settings.get("recent_files", [])
+        if isinstance(recent, list):
+            cleaned = []
+            for item in recent:
+                try:
+                    p = Path(item).expanduser()
+                    if p.exists() and str(p) not in cleaned:
+                        cleaned.append(str(p))
+                except Exception:
+                    pass
+            self._recent = cleaned
+
+    def _save_settings(self):
+        try:
+            sd = _settings_dir()
+            sd.mkdir(parents=True, exist_ok=True)
+            
+            # Add current workspace folder to recents (so it appears in Recent ▾)
+            # This way the last folder is not auto-restored, but is available in recents
+            recent_with_folder = self._recent.copy()
+            ws_str = str(self._workspace_dir)
+            if ws_str in recent_with_folder:
+                recent_with_folder.remove(ws_str)
+            recent_with_folder.insert(0, ws_str)
+            recent_with_folder = recent_with_folder[:self.MAX_RECENT]
+            
+            data = {
+                "autosave": self.autosave,
+                "cowlang_exe": self._cowlang_exe,
+                "last_save_dir": self._last_save_dir,
+                "workspace_dir": str(self._workspace_dir),
+                "recent_files": recent_with_folder,  # Include workspace folder in recents
+                "theme": self._theme,
+                "cl_exts": sorted(CL_EXTS),
+                "colour_theme": getattr(self, "_colour_theme", "CLIDE Dark (default)"),
+            }
+            _settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _push_recent(self,path):
         if path in self._recent: self._recent.remove(path)
@@ -835,11 +1450,16 @@ class CLIDE(ctk.CTk):
             b.bind("<Leave>",lambda e,l=b,ob=bg_col or "#21262d":l.configure(bg=ob))
             return b
 
-        tbtn("New",       self.new_file).pack(side="left",padx=(8,2),pady=7)
-        tbtn("Open",      self.open_file).pack(side="left",padx=2,pady=7)
+        self._new_btn = tbtn("New ▾", self._open_new_menu)
+        self._new_btn.pack(side="left",padx=(8,2),pady=7)
+        
+        self._open_btn = tbtn("Open ▾", self._open_open_menu)
+        self._open_btn.pack(side="left",padx=2,pady=7)
+
         tbtn("Save",      self.save_file).pack(side="left",padx=2,pady=7)
         tbtn("Save As",   self.save_file_as).pack(side="left",padx=2,pady=7)
-        tbtn("Recent ▾",  self._open_recent_menu).pack(side="left",padx=2,pady=7)
+        self._recent_btn=tbtn("Recent ▾",self._open_recent_menu)
+        self._recent_btn.pack(side="left",padx=2,pady=7)
         tk.Frame(tb,bg=BORDER,width=1).pack(side="left",fill="y",padx=8,pady=8)
         tbtn("Find/Replace",self.toggle_find).pack(side="left",padx=2,pady=7)
         tbtn("⚙ Settings",  self._open_settings).pack(side="left",padx=2,pady=7)
@@ -900,7 +1520,7 @@ class CLIDE(ctk.CTk):
         # Main area
         main=tk.Frame(self,bg=BG)
         main.pack(fill="both",expand=True)
-        self.sidebar=FileBrowser(main,on_open=self._open_from_browser,width=195)
+        self.sidebar=FileBrowser(main,on_open=self._open_from_browser,root_path=self._workspace_dir,width=195)
         self.sidebar.pack(side="left",fill="y")
         tk.Frame(main,bg=BORDER,width=1).pack(side="left",fill="y")
 
@@ -972,7 +1592,8 @@ class CLIDE(ctk.CTk):
         tinput_row=tk.Frame(term_outer,bg=TERMINAL_BG,height=28)
         tinput_row.pack(fill="x"); tinput_row.pack_propagate(False)
         self._prompt_lbl=tk.Label(tinput_row,text="$",bg=TERMINAL_BG,fg=ACCENT,
-                 font=("Courier New",12,"bold"),width=2).pack(side="left",padx=(8,0))
+                 font=("Courier New",12,"bold"),width=2)
+        self._prompt_lbl.pack(side="left",padx=(8,0))
         self.term_input=tk.Entry(tinput_row,bg=TERMINAL_BG,fg=TEXT,insertbackground=ACCENT,
             font=("Courier New",12),relief="flat",bd=2,highlightthickness=0)
         self.term_input.pack(side="left",fill="x",expand=True,padx=4)
@@ -1115,9 +1736,57 @@ class CLIDE(ctk.CTk):
     # ── File ops ──────────────────────────────────────────────────────────────
     def new_file(self): self._new_tab()
     def open_file(self):
-        initial=str(Path(self.current_file).parent) if self.current_file else str(Path.home())
+        initial=str(Path(self.current_file).parent) if self.current_file else str(self._workspace_dir)
         path=ask_open_file(self,initial_dir=initial)
         if path: self._open_path(path)
+    # ── New / Open Menus ──────────────────────────────────────────────────────
+    def _open_new_menu(self):
+        global _active_dropdown_menu
+        _close_dropdown()  # Close any existing dropdown first
+        
+        menu = tk.Menu(self, tearoff=0, bg="#21262d", fg=TEXT, activebackground=ACCENT2,
+                     activeforeground=BG, font=("Courier New", 11), bd=0, relief="flat")
+        menu.add_command(label="  New File", command=self.new_file)
+        menu.add_command(label="  New Folder", command=self.new_folder)
+        btn = self._new_btn
+        
+        _active_dropdown_menu = menu
+        menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+
+    def new_folder(self):
+        dialog = ctk.CTkInputDialog(text="Enter folder name:", title="New Folder")
+        name = dialog.get_input()
+        if name:
+            # Create the folder inside the directory currently shown in the sidebar
+            target = self.sidebar._root_path / name
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                self.sidebar.refresh()
+                self.log(f"Created folder: {target}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not create folder:\n{e}")
+
+    def _open_open_menu(self):
+        global _active_dropdown_menu
+        _close_dropdown()  # Close any existing dropdown first
+        
+        menu = tk.Menu(self, tearoff=0, bg="#21262d", fg=TEXT, activebackground=ACCENT2,
+                     activeforeground=BG, font=("Courier New", 11), bd=0, relief="flat")
+        menu.add_command(label="  Open File", command=self.open_file)
+        menu.add_command(label="  Open Folder", command=self.open_folder)
+        btn = self._open_btn
+        
+        _active_dropdown_menu = menu
+        menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+
+    def open_folder(self):
+        initial = str(self._workspace_dir)
+        path = ask_directory(self, initial_dir=initial)
+        if path:
+            self.sidebar.set_dir(path)
+            self._workspace_dir = Path(path)
+            self._save_settings()
+            self.log(f"Workspace set to: {path}")
     def _open_from_browser(self,path): self._open_path(path)
     def _open_path(self,path):
         for i,t in enumerate(self._tabs):
@@ -1156,7 +1825,7 @@ class CLIDE(ctk.CTk):
             initial_dir=str(Path(tab.path).parent)
         else:
             initial_file=""
-            initial_dir=getattr(self,"_last_save_dir",str(Path.home()))
+            initial_dir=getattr(self,"_last_save_dir",str(self._workspace_dir))
         path=ask_save_file(self,initial_dir=initial_dir,default_ext=".cow",initial_file=initial_file)
         if path:
             tab.path=path
@@ -1180,7 +1849,10 @@ class CLIDE(ctk.CTk):
 
     # ── Recent ────────────────────────────────────────────────────────────────
     def _open_recent_menu(self):
+        global _active_dropdown_menu
         if not self._recent: messagebox.showinfo("CLIDE","No recent files yet 🐄"); return
+        _close_dropdown()  # Close any existing dropdown first
+        
         menu=tk.Menu(self,tearoff=0,bg="#21262d",fg=TEXT,activebackground=ACCENT2,
                      activeforeground=BG,font=("Courier New",11),bd=0,relief="flat")
         for path in self._recent:
@@ -1189,8 +1861,10 @@ class CLIDE(ctk.CTk):
                              command=lambda p=path:self._open_path(p))
         menu.add_separator()
         menu.add_command(label="  Clear recent list",command=self._clear_recent)
-        try: menu.tk_popup(self.winfo_pointerx(),self.winfo_pointery())
-        finally: menu.grab_release()
+        
+        btn=self._recent_btn
+        _active_dropdown_menu = menu
+        menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty()+btn.winfo_height())
     def _clear_recent(self): self._recent=[]; self._save_settings()
 
     # ── Key events ────────────────────────────────────────────────────────────
@@ -1330,51 +2004,96 @@ class CLIDE(ctk.CTk):
         try:
             if not Path(self._cowlang_exe).exists():
                 self.log(f"✗  Translator not found:\n   {self._cowlang_exe}")
-                self.log("   Run the CowLang Installer or set path in Settings."); return
-            clt_dir=str(Path(self._cowlang_exe).parent)
-            m=re.search(r"CLT[_\-]?(\d+\.\d+[\.\d]*)",Path(self._cowlang_exe).name,re.IGNORECASE)
-            clt_ver=m.group(1) if m else "unknown"
-            self.log(f"   CLT version: {clt_ver}")
-            src=Path(self.current_file).read_text(encoding="utf-8")
-            start=time.time()
+                self.log("   Run the CowLang Installer or set path in Settings.")
+                return
 
-            proc=subprocess.Popen(
+            clt_dir = str(Path(self._cowlang_exe).parent)
+            m = re.search(r"CLT[_\-]?(\d+\.\d+[\.\d]*)", Path(self._cowlang_exe).name, re.IGNORECASE)
+            clt_ver = m.group(1) if m else "unknown"
+            self.log(f"   CLT version: {clt_ver}")
+
+            # 🔒 block non-CowLang files
+            ext = Path(self.current_file).suffix.lower()
+            if ext not in CL_EXTS:
+                self.log_error(f"✗  Cannot run '{Path(self.current_file).name}' — not a CowLang file.")
+                return
+
+            src = Path(self.current_file).read_text(encoding="utf-8")
+            start = time.time()
+
+            # Launch CLT subprocess
+            proc = subprocess.Popen(
                 [self._cowlang_exe],
                 cwd=clt_dir,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,  # <<< FIX: kill >>> prompts
+                stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1)
-            self._running_proc=proc
+                bufsize=1
+            )
+            self._running_proc = proc
+            self._program_started = True
 
-            # Send source then keep stdin open for user read() calls
-            proc.stdin.write(src + "\n")
+            # Send source code once
+            src_to_send = src if src.endswith("\n") else src + "\n"
+            proc.stdin.write(src_to_send)
             proc.stdin.flush()
 
-            # Update prompt label to show >>> while program is running
+            # Set terminal prompt
             self.after(0, lambda: self._prompt_lbl.configure(text=">>>", fg=WARN))
+            self.after(0, lambda: self.term_input.focus_set())
 
             # Stream stdout line by line
-            any_output=False
-            for line in proc.stdout:
-                self.log(line.rstrip())
-                any_output=True
+            any_output = [False]
+            buf = []
+
+            while True:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    if proc.poll() is not None:
+                        break
+                    continue
+
+                any_output[0] = True
+                if ch == "\n":
+                    line = "".join(buf).rstrip()
+                    buf.clear()
+
+                    # Filter out CLT's own >>> prompt
+                    if line.startswith(">>>"):
+                        continue
+
+                    self.log(line)
+
+                    # If the program requests input, show prompt manually
+                    if line.lower().startswith("read") or line.endswith(":"):
+                        self.after(0, lambda: self._prompt_lbl.configure(text=">>>"))
+
+                else:
+                    buf.append(ch)
+
+            # Flush any remaining partial line
+            if buf:
+                line = "".join(buf).rstrip()
+                if not line.startswith(">>>"):
+                    self.log(line)
+                buf.clear()
 
             proc.wait()
-            elapsed=int((time.time()-start)*1000)
-            code=proc.returncode
-            if code==0:
+            elapsed = int((time.time() - start) * 1000)
+            code = proc.returncode
+            if code == 0:
                 self.log_ok(f"\n✓  done in {elapsed}ms | exit 0")
             else:
                 self.log_error(f"\n✗  done in {elapsed}ms | exit {code}")
-                if not any_output:
+                if not any_output[0]:
                     self.log_error("   (no output — check translator path in Settings)")
 
         except Exception as e:
             self.log_error(f"✗  ERROR: {e}")
+
         finally:
-            self._running_proc=None
+            self._running_proc = None
             self.after(0, lambda: self._prompt_lbl.configure(text="$", fg=ACCENT))
 
     # ── Terminal ──────────────────────────────────────────────────────────────
@@ -1424,30 +2143,47 @@ class CLIDE(ctk.CTk):
             content = self.terminal.get("1.0","end-1c")
             self.clipboard_clear()
             self.clipboard_append(content)
+
+    def _send_running_input(self, text: str):
+        if (
+            self._running_proc
+            and self._running_proc.poll() is None
+            and getattr(self, "_program_started", False)
+        ):
+            try:
+                self._running_proc.stdin.write(text + "\n")
+                self._running_proc.stdin.flush()
+                return True
+            except Exception as e:
+                self.log_error(f"Input error: {e}")
+        return False
+
     def _run_shell_cmd(self,_=None):
         text=self.term_input.get().strip()
         if not text: return
         self.term_input.delete(0,"end")
         # If a CowLang program is running and waiting for input, pipe to it
-        if self._running_proc and self._running_proc.poll() is None:
+        if self._send_running_input(text):
+            # don't log >>> manually, prompt label already shows it
             self.log(f">>> {text}")
-            try:
-                self._running_proc.stdin.write(text+"\n")
-                self._running_proc.stdin.flush()
-            except Exception as e:
-                self.log_error(f"Input error: {e}")
+            self.term_input.bind("<Return>", self._send_input_repl)
             return
         # Otherwise run as a shell command
         self.log(f"$ {text}")
         cwd=str(Path(self.current_file).parent) if self.current_file else None
         threading.Thread(target=self._shell_thread,args=(text,cwd),daemon=True).start()
-    def _shell_thread(self,cmd,cwd):
+    def _shell_thread(self, cmd, cwd):
         try:
-            proc=subprocess.Popen(cmd,shell=True,cwd=cwd,
-                stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-            for line in proc.stdout: self.log(line.rstrip())
-            proc.wait(); self.log(f"(exit {proc.returncode})")
-        except Exception as e: self.log(f"Shell error: {e}")
+            proc = subprocess.Popen(
+                cmd, shell=True, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            for line in proc.stdout:
+                self.log(line.rstrip())  # filter >>> here if needed: if line.startswith(">>>"): continue
+            proc.wait()
+            self.log(f"(exit {proc.returncode})")
+        except Exception as e:
+            self.log(f"Shell error: {e}")
 
     def _update_cursor(self,_=None):
         try:
@@ -1475,28 +2211,483 @@ class CLIDE(ctk.CTk):
 
     # ── Settings dialog ───────────────────────────────────────────────────────
     def _open_settings(self):
-        dlg=ctk.CTkToplevel(self); dlg.title("CLIDE Settings")
-        dlg.geometry("520x230"); dlg.configure(fg_color=PANEL); dlg.grab_set()
-        ctk.CTkLabel(dlg,text="CowLang Translator Path",
-                     font=ctk.CTkFont("Courier New",12,"bold"),
-                     text_color=TEXT).pack(anchor="w",padx=16,pady=(16,4))
-        exe_var=ctk.StringVar(value=self._cowlang_exe)
-        row=ctk.CTkFrame(dlg,fg_color="transparent"); row.pack(fill="x",padx=16)
-        ctk.CTkEntry(row,textvariable=exe_var,font=ctk.CTkFont("Courier New",11),
-                     fg_color="#21262d",border_color=BORDER,text_color=TEXT,
-                     height=32).pack(side="left",fill="x",expand=True,padx=(0,8))
-        def _browse():
-            p=ask_open_exe(dlg,str(Path(self._cowlang_exe).parent))
-            if p: exe_var.set(p)
-        ctk.CTkButton(row,text="Browse",width=70,height=32,fg_color="#21262d",
-                      hover_color="#30363d",text_color=ACCENT2,border_color=BORDER,
-                      border_width=1,font=ctk.CTkFont("Courier New",11),
-                      command=_browse).pack(side="left")
-        def _save(): self._cowlang_exe=exe_var.get(); self._save_settings(); dlg.destroy()
-        ctk.CTkButton(dlg,text="Save",command=_save,height=36,fg_color=ACCENT,
-                      hover_color="#2ea043",text_color=BG,
-                      font=ctk.CTkFont("Courier New",12,"bold")).pack(padx=16,pady=16,fill="x")
+        # singleton guard
+        if self._settings_win is not None:
+            try: self._settings_win.focus_force(); return
+            except Exception: self._settings_win = None
 
+        dlg = tk.Toplevel(self)
+        self._settings_win = dlg
+
+        def _on_close():
+            self._settings_win = None
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", _on_close)
+        dlg.title("CLIDE Settings")
+        dlg.geometry("640x560")
+        dlg.configure(bg=PANEL)
+        dlg.resizable(False, False)
+        try: dlg.grab_set()
+        except Exception: pass
+
+        # ── manual tab bar ────────────────────────────────────────────────────
+        TAB_NAMES = ["General", "Appearance", "File Types", "Keybindings"]
+        _active_tab = tk.StringVar(value="General")
+        _panes = {}
+
+        tab_bar = tk.Frame(dlg, bg=TAB_BG, height=32)
+        tab_bar.pack(fill="x"); tab_bar.pack_propagate(False)
+        tk.Frame(dlg, bg=BORDER, height=1).pack(fill="x")
+
+        pane_area = tk.Frame(dlg, bg=BG)
+        pane_area.pack(fill="both", expand=True)
+
+        _tab_btns = {}
+
+        def _switch(name):
+            _active_tab.set(name)
+            for n, p in _panes.items():
+                p.pack_forget() if n != name else p.pack(fill="both", expand=True)
+            for n, b in _tab_btns.items():
+                b.configure(bg=BG if n==name else TAB_BG,
+                            fg=TEXT if n==name else MUTED,
+                            relief="flat")
+
+        for name in TAB_NAMES:
+            b = tk.Label(tab_bar, text=f"  {name}  ", bg=TAB_BG, fg=MUTED,
+                         font=("Courier New",11), cursor="hand2", pady=6,
+                         relief="flat", highlightthickness=0)
+            b.bind("<Button-1>", lambda e, n=name: _switch(n))
+            b.bind("<Enter>",    lambda e, l=b, n=name: l.configure(
+                                     fg=TEXT) if n!=_active_tab.get() else None)
+            b.bind("<Leave>",    lambda e, l=b, n=name: l.configure(
+                                     fg=MUTED) if n!=_active_tab.get() else None)
+            b.pack(side="left")
+            _tab_btns[name] = b
+
+        for name in TAB_NAMES:
+            f = tk.Frame(pane_area, bg=BG)
+            _panes[name] = f
+
+        # ── shared helpers ────────────────────────────────────────────────────
+        def section(parent, text):
+            tk.Label(parent, text=text, bg=BG, fg=MUTED,
+                     font=("Courier New",9,"bold")).pack(anchor="w",padx=12,pady=(14,2))
+            tk.Frame(parent, bg=BORDER, height=1).pack(fill="x",padx=12,pady=(0,8))
+
+        def entry_row(parent, label, var, browse_cmd=None):
+            tk.Label(parent, text=label, bg=BG, fg=TEXT,
+                     font=("Courier New",11)).pack(anchor="w",padx=12,pady=(0,2))
+            r = tk.Frame(parent, bg=BG); r.pack(fill="x",padx=12,pady=(0,10))
+            tk.Entry(r, textvariable=var, bg="#21262d", fg=TEXT,
+                     insertbackground=ACCENT2, font=("Courier New",11),
+                     relief="flat", bd=4, highlightthickness=1,
+                     highlightbackground=BORDER,
+                     highlightcolor=ACCENT2).pack(side="left",fill="x",expand=True)
+            if browse_cmd:
+                b = tk.Label(r, text="Browse", bg="#21262d", fg=ACCENT2,
+                             font=("Courier New",10), cursor="hand2",
+                             padx=10, pady=4,
+                             highlightthickness=1, highlightbackground=BORDER)
+                b.bind("<Button-1>", lambda e: browse_cmd())
+                b.bind("<Enter>",    lambda e: b.configure(bg="#30363d"))
+                b.bind("<Leave>",    lambda e: b.configure(bg="#21262d"))
+                b.pack(side="left", padx=(6,0))
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB: GENERAL
+        # ════════════════════════════════════════════════════════════════════
+        gen = _panes["General"]
+
+        section(gen, "COWLANG TRANSLATOR")
+        exe_var = tk.StringVar(value=self._cowlang_exe)
+        def _browse_exe():
+            p = ask_open_exe(dlg, str(Path(self._cowlang_exe).parent))
+            if p: exe_var.set(p)
+        entry_row(gen, "Translator executable path", exe_var, _browse_exe)
+
+        section(gen, "WORKSPACE")
+        ws_var = tk.StringVar(value=str(self._workspace_dir))
+        def _browse_ws():
+            p = ask_directory(dlg, str(self._workspace_dir))
+            if p: ws_var.set(p)
+        entry_row(gen, "Default workspace directory", ws_var, _browse_ws)
+
+        section(gen, "BEHAVIOUR")
+        as_var = tk.BooleanVar(value=self.autosave)
+        asf = tk.Frame(gen, bg=BG); asf.pack(anchor="w", padx=12, pady=4)
+        tk.Checkbutton(asf, text="Autosave  (saves 1.5 s after you stop typing)",
+                       variable=as_var, bg=BG, fg=TEXT, selectcolor="#21262d",
+                       activebackground=BG, activeforeground=TEXT,
+                       font=("Courier New",11), bd=0, relief="flat",
+                       cursor="hand2").pack(side="left")
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB: APPEARANCE
+        # ════════════════════════════════════════════════════════════════════
+        app_tab = _panes["Appearance"]
+
+        # section(app_tab, "THEME")
+        # theme_var = tk.StringVar(value=self._theme)
+        # theme_row = tk.Frame(app_tab, bg=BG)
+        # theme_row.pack(anchor="w", padx=12, pady=(0,6))
+        # for val, label in [("dark","🌙  Dark (default)"),("light","☀️  Light")]:
+        #     tk.Radiobutton(theme_row, text=label, variable=theme_var, value=val,
+        #                    bg=BG, fg=TEXT, selectcolor="#21262d",
+        #                    activebackground=BG, activeforeground=TEXT,
+        #                    font=("Courier New",12), bd=0, relief="flat",
+        #                    cursor="hand2").pack(side="left", padx=(0,24))
+        # tk.Label(app_tab, text="  Note: editor & terminal colours fully apply after restart.",
+        #          bg=BG, fg=MUTED, font=("Courier New",9)).pack(anchor="w", padx=12)
+
+        section(app_tab, "FONT SIZE")
+        font_size_var = tk.IntVar(value=getattr(self,"_font_size",12))
+        fsf = tk.Frame(app_tab, bg=BG); fsf.pack(anchor="w", padx=12, pady=4)
+        tk.Label(fsf, text="Editor font size:", bg=BG, fg=TEXT,
+                 font=("Courier New",11)).pack(side="left", padx=(0,10))
+        for sz in (10,11,12,13,14,16):
+            tk.Radiobutton(fsf, text=str(sz), variable=font_size_var, value=sz,
+                           bg=BG, fg=TEXT, selectcolor="#21262d",
+                           activebackground=BG, activeforeground=TEXT,
+                           font=("Courier New",11), bd=0, relief="flat",
+                           cursor="hand2").pack(side="left", padx=4)
+
+        section(app_tab, "CUSTOMISE THEME")
+
+        # ── theme selector row ────────────────────────────────────────────
+        all_themes = _all_themes()
+        theme_names = list(all_themes.keys())
+        sel_theme_var = tk.StringVar(value=getattr(self,'_colour_theme','CLIDE Dark (default)'))
+        if sel_theme_var.get() not in theme_names:
+            sel_theme_var.set(theme_names[0])
+
+        tsel_row = tk.Frame(app_tab, bg=BG); tsel_row.pack(fill='x', padx=12, pady=(0,6))
+        tk.Label(tsel_row, text='Active theme:', bg=BG, fg=TEXT,
+                 font=('Courier New',11)).pack(side='left', padx=(0,8))
+
+        # scrollable dropdown via OptionMenu
+        tdd = tk.OptionMenu(tsel_row, sel_theme_var, *theme_names)
+        tdd.configure(bg='#21262d', fg=TEXT, activebackground=BORDER,
+                      activeforeground=TEXT, highlightthickness=0,
+                      font=('Courier New',11), bd=0, relief='flat', width=28)
+        tdd['menu'].configure(bg='#21262d', fg=TEXT, font=('Courier New',11),
+                              activebackground=ACCENT2, activeforeground=BG)
+        tdd.pack(side='left')
+
+        # colour swatch grid
+        swatch_frame = tk.Frame(app_tab, bg=BG)
+        swatch_frame.pack(fill='x', padx=12, pady=(4,0))
+
+        # dict of key -> StringVar for the colour editor
+        colour_vars = {}
+        swatch_labels = {}
+
+        def _build_swatches(d):
+            for w in swatch_frame.winfo_children(): w.destroy()
+            colour_vars.clear(); swatch_labels.clear()
+            cols = 2
+            for i, (key, label) in enumerate(COLOUR_KEYS):
+                val = d.get(key, '#ffffff')
+                r = i // cols; c = i % cols
+                cell = tk.Frame(swatch_frame, bg=BG)
+                cell.grid(row=r, column=c, sticky='ew', padx=(0,8), pady=2)
+                swatch_frame.columnconfigure(c, weight=1)
+                sw = tk.Label(cell, bg=val, width=3, relief='flat',
+                              highlightthickness=1, highlightbackground=BORDER)
+                sw.pack(side='left', padx=(0,4))
+                swatch_labels[key] = sw
+                var = tk.StringVar(value=val)
+                colour_vars[key] = var
+                ent = tk.Entry(cell, textvariable=var, width=9,
+                               bg='#21262d', fg=TEXT, insertbackground=ACCENT2,
+                               font=('Courier New',10), relief='flat', bd=2,
+                               highlightthickness=1, highlightbackground=BORDER,
+                               highlightcolor=ACCENT2)
+                ent.pack(side='left', padx=(0,4))
+                def _update_sw(e, k=key, v=var, s=sw):
+                    try: s.configure(bg=v.get())
+                    except Exception: pass
+                ent.bind('<KeyRelease>', _update_sw)
+                tk.Label(cell, text=label, bg=BG, fg=MUTED,
+                         font=('Courier New',9)).pack(side='left')
+
+        def _on_theme_select(*_):
+            name = sel_theme_var.get()
+            themes = _all_themes()
+            if name in themes:
+                _build_swatches(themes[name])
+
+        sel_theme_var.trace_add('write', _on_theme_select)
+        _build_swatches(all_themes.get(sel_theme_var.get(),
+                                       list(all_themes.values())[0]))
+
+        # save-as custom theme row
+        saveas_row = tk.Frame(app_tab, bg=BG)
+        saveas_row.pack(fill='x', padx=12, pady=(8,4))
+        saveas_var = tk.StringVar(value='')
+        saveas_ent = tk.Entry(saveas_row, textvariable=saveas_var, width=22,
+                              bg='#21262d', fg=TEXT, insertbackground=ACCENT2,
+                              font=('Courier New',11), relief='flat', bd=3,
+                              highlightthickness=1, highlightbackground=BORDER,
+                              highlightcolor=ACCENT2)
+        saveas_ent.insert(0, 'My Theme')
+        saveas_ent.pack(side='left', padx=(0,6))
+
+        def _save_custom_theme():
+            name = saveas_var.get().strip()
+            if not name: return
+            d = {k: colour_vars[k].get() for k in colour_vars}
+            custom = _load_custom_themes()
+            custom[name] = d
+            _save_custom_themes(custom)
+            # rebuild dropdown
+            new_names = list(_all_themes().keys())
+            tdd['menu'].delete(0, 'end')
+            for n in new_names:
+                tdd['menu'].add_command(label=n,
+                    command=lambda v=n: sel_theme_var.set(v))
+            sel_theme_var.set(name)
+
+        def _delete_custom_theme():
+            name = sel_theme_var.get()
+            if name in _BUILTIN_THEMES:
+                messagebox.showinfo('CLIDE', 'Cannot delete a built-in theme.')
+                return
+            custom = _load_custom_themes()
+            if name in custom:
+                del custom[name]
+                _save_custom_themes(custom)
+            new_names = list(_all_themes().keys())
+            tdd['menu'].delete(0, 'end')
+            for n in new_names:
+                tdd['menu'].add_command(label=n,
+                    command=lambda v=n: sel_theme_var.set(v))
+            sel_theme_var.set(new_names[0])
+
+        for lbl, cmd in [('Save as new theme', _save_custom_theme),
+                          ('Delete', _delete_custom_theme)]:
+            b = tk.Label(saveas_row, text=lbl, bg='#21262d', fg=TEXT,
+                         font=('Courier New',10), cursor='hand2',
+                         padx=8, pady=4,
+                         highlightthickness=1, highlightbackground=BORDER)
+            b.bind('<Button-1>', lambda e, c=cmd: c())
+            b.bind('<Enter>',    lambda e, l=b: l.configure(bg='#30363d'))
+            b.bind('<Leave>',    lambda e, l=b: l.configure(bg='#21262d'))
+            b.pack(side='left', padx=(0,4))
+
+        tk.Label(app_tab,
+                 text='  Colours apply after Save + restart. Save as new theme to keep edits.',
+                 bg=BG, fg=MUTED, font=('Courier New',9)).pack(anchor='w', padx=12, pady=(2,8))
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB: FILE TYPES
+        # ════════════════════════════════════════════════════════════════════
+        ft_tab = _panes["File Types"]
+
+        section(ft_tab, "COWLANG EXTENSIONS")
+        tk.Label(ft_tab,
+                 text="  Built-in extensions (read-only). Cannot be modified.",
+                 bg=BG, fg=MUTED, font=("Courier New",9)).pack(anchor="w",padx=12,pady=(0,8))
+
+        ft_frame = tk.Frame(ft_tab, bg=BG)
+        ft_frame.pack(fill="both", expand=True, padx=12, pady=(0,8))
+
+        ft_lb = tk.Listbox(ft_frame, bg="#21262d", fg=ACCENT,
+                            selectbackground=ACCENT2, selectforeground=BG,
+                            font=("Courier New",12), relief="flat", bd=0,
+                            activestyle="none", exportselection=False,
+                            highlightthickness=0, height=7, state="disabled")
+        ft_lb.pack(side="left", fill="both", expand=True)
+        ft_lb.configure(state="normal")
+        for ext in sorted(CL_EXTS): ft_lb.insert("end", ext)
+        ft_lb.configure(state="disabled")
+
+        ft_right = tk.Frame(ft_frame, bg=BG)
+        ft_right.pack(side="left", padx=(10,0), anchor="n")
+        
+        # Disabled Add/Remove buttons (greyed out)
+        tk.Label(ft_right, text="Add", bg="#21262d", fg="#5a6370",
+                 font=("Courier New",10), padx=8, pady=4,
+                 highlightthickness=1, highlightbackground=BORDER).pack(fill="x", pady=2)
+        tk.Label(ft_right, text="Remove", bg="#21262d", fg="#5a6370",
+                 font=("Courier New",10), padx=8, pady=4,
+                 highlightthickness=1, highlightbackground=BORDER).pack(fill="x", pady=2)
+
+        # ════════════════════════════════════════════════════════════════════
+        # TAB: KEYBINDINGS
+        # ════════════════════════════════════════════════════════════════════
+        kb_tab = _panes["Keybindings"]
+
+        section(kb_tab, "KEYBOARD SHORTCUTS")
+
+        DEFAULT_KEYBINDS = [
+            ("Ctrl+S",                "Save file"),
+            ("Ctrl+Shift+S",          "Save As"),
+            ("Ctrl+O",                "Open file"),
+            ("Ctrl+N",                "New file"),
+            ("Ctrl+W",                "Close tab"),
+            ("Ctrl+Tab",              "Next tab"),
+            ("Ctrl+F",                "Find / Replace"),
+            ("Ctrl+/",                "Toggle line comment"),
+            ("Ctrl+Z",                "Undo"),
+            ("Ctrl+Y",                "Redo"),
+            ("Ctrl+\\",             "Toggle split view"),
+            ("Ctrl+Space",            "Autocomplete"),
+            ("F5",                    "Run CowLang program"),
+            ("F11",                   "Toggle fullscreen"),
+            ("Tab",                   "Indent (2 spaces)"),
+            ("Enter (in block)",      "Auto-indent to block depth"),
+            ("Ctrl+C / Ctrl+Shift+C", "Copy terminal output"),
+        ]
+
+        kb_frame = tk.Frame(kb_tab, bg=BG)
+        kb_frame.pack(fill="both", expand=True, padx=12, pady=(0,8))
+
+        # Keybindings list with edit fields
+        kb_vars = {}
+        kb_scroll = tk.Canvas(kb_frame, bg=BG, highlightthickness=0)
+        kb_scroll.pack(side="left", fill="both", expand=True)
+        
+        kb_inner = tk.Frame(kb_scroll, bg=BG)
+        kb_scroll_window = kb_scroll.create_window((0, 0), window=kb_inner, anchor="nw")
+        
+        def _on_kb_configure(event):
+            kb_scroll.configure(scrollregion=kb_scroll.bbox("all"))
+            kb_scroll.itemconfig(kb_scroll_window, width=event.width)
+        
+        kb_inner.bind("<Configure>", _on_kb_configure)
+        kb_scroll.bind("<MouseWheel>", lambda e: kb_scroll.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        kb_scroll.bind("<Button-4>", lambda e: kb_scroll.yview_scroll(-1, "units"))
+        kb_scroll.bind("<Button-5>", lambda e: kb_scroll.yview_scroll(1, "units"))
+
+        for key, desc in DEFAULT_KEYBINDS:
+            row = tk.Frame(kb_inner, bg=BG)
+            row.pack(fill="x", pady=2)
+            
+            tk.Label(row, text=desc, bg=BG, fg=TEXT, font=("Courier New",10), width=30, anchor="w").pack(side="left", padx=(0,8))
+            
+            var = tk.StringVar(value=key)
+            kb_vars[desc] = var
+            
+            entry = tk.Entry(row, textvariable=var, bg="#21262d", fg=ACCENT2,
+                            insertbackground=ACCENT2, font=("Courier New",10),
+                            relief="flat", bd=2, highlightthickness=1,
+                            highlightbackground=BORDER, highlightcolor=ACCENT2, width=18)
+            entry.pack(side="left")
+
+        kb_right = tk.Frame(kb_tab, bg=BG)
+        kb_right.pack(side="right", anchor="n", padx=(0,12), pady=(0,8))
+        
+        def _reset_keybinds():
+            if messagebox.askyesno("Reset Keybindings", "Reset all keybindings to defaults?"):
+                for key, desc in DEFAULT_KEYBINDS:
+                    kb_vars[desc].set(key)
+
+        kb_reset_lbl = tk.Label(kb_right, text="Reset to Default", bg="#21262d", fg=TEXT,
+                               font=("Courier New",10), cursor="hand2",
+                               padx=8, pady=4,
+                               highlightthickness=1, highlightbackground=BORDER)
+        kb_reset_lbl.bind("<Button-1>", lambda e: _reset_keybinds())
+        kb_reset_lbl.bind("<Enter>",    lambda e: kb_reset_lbl.configure(bg="#30363d"))
+        kb_reset_lbl.bind("<Leave>",    lambda e: kb_reset_lbl.configure(bg="#21262d"))
+        kb_reset_lbl.pack(fill="x", pady=2)
+
+        # ════════════════════════════════════════════════════════════════════
+        # BOTTOM BAR — Apply / Undo / Reset / Cancel
+        # ════════════════════════════════════════════════════════════════════
+        tk.Frame(dlg, bg=BORDER, height=1).pack(fill="x")
+        bot = tk.Frame(dlg, bg=PANEL); bot.pack(fill="x", padx=12, pady=8)
+
+        # Store original values for undo
+        original_exe = exe_var.get()
+        original_ws = ws_var.get()
+        original_autosave = as_var.get()
+        original_theme = getattr(self, "_theme", "dark")
+        original_colour = getattr(self, "_colour_theme", "CLIDE Dark (default)")
+        original_kb = {desc: var.get() for desc, var in kb_vars.items()}
+
+        def _apply():
+            self._cowlang_exe = exe_var.get()
+            try:
+                self._workspace_dir = Path(ws_var.get()).expanduser()
+                self._workspace_dir.mkdir(parents=True, exist_ok=True)
+                self.sidebar.set_dir(str(self._workspace_dir))
+                self._last_save_dir = str(self._workspace_dir)
+            except Exception: pass
+            self.autosave = as_var.get()
+            self._autosave_var.set(self.autosave)
+            new_theme = getattr(self, "_theme", "dark")  # Not using theme toggle in this version
+            chosen = sel_theme_var.get()
+            self._colour_theme = chosen
+            themes = _all_themes()
+            if chosen in themes:
+                _apply_colour_dict(themes[chosen])
+            # Note: CL_EXTS not modified (read-only)
+            # Note: Keybindings saved but not reloaded (would need restart)
+            self._save_settings()
+            messagebox.showinfo("Settings", "Settings applied successfully!")
+
+        def _undo():
+            if messagebox.askyesno("Undo Changes", "Discard all unsaved changes?"):
+                exe_var.set(original_exe)
+                ws_var.set(original_ws)
+                as_var.set(original_autosave)
+                sel_theme_var.set(original_colour)
+                for desc, var in kb_vars.items():
+                    var.set(original_kb.get(desc, ""))
+
+        def _reset_all():
+            if messagebox.askyesno("Reset Settings", "Reset all settings to defaults?"):
+                exe_var.set(DEFAULT_EXE)
+                ws_var.set(str(_default_workspace_dir()))
+                as_var.set(True)
+                sel_theme_var.set("CLIDE Dark (default)")
+                for key, desc in DEFAULT_KEYBINDS:
+                    kb_vars[desc].set(key)
+
+        # Button styles
+        button_style = {
+            "font": ("Courier New", 11),
+            "cursor": "hand2",
+            "padx": 12,
+            "pady": 6,
+            "relief": "flat",
+            "bd": 0,
+            "highlightthickness": 1,
+            "highlightbackground": BORDER
+        }
+
+        cancel_lbl = tk.Label(bot, text="Cancel", bg=PANEL, fg=MUTED, **button_style)
+        cancel_lbl.bind("<Button-1>", lambda e: _on_close())
+        cancel_lbl.bind("<Enter>",    lambda e: cancel_lbl.configure(fg=TEXT))
+        cancel_lbl.bind("<Leave>",    lambda e: cancel_lbl.configure(fg=MUTED))
+        cancel_lbl.pack(side="right", padx=(4,0))
+
+        reset_lbl = tk.Label(bot, text="Reset", bg="#21262d", fg=TEXT, **button_style)
+        reset_lbl.bind("<Button-1>", lambda e: _reset_all())
+        reset_lbl.bind("<Enter>",    lambda e: reset_lbl.configure(bg="#30363d"))
+        reset_lbl.bind("<Leave>",    lambda e: reset_lbl.configure(bg="#21262d"))
+        reset_lbl.pack(side="right", padx=4)
+
+        undo_lbl = tk.Label(bot, text="Undo", bg="#21262d", fg=TEXT, **button_style)
+        undo_lbl.bind("<Button-1>", lambda e: _undo())
+        undo_lbl.bind("<Enter>",    lambda e: undo_lbl.configure(bg="#30363d"))
+        undo_lbl.bind("<Leave>",    lambda e: undo_lbl.configure(bg="#21262d"))
+        undo_lbl.pack(side="right", padx=4)
+
+        apply_lbl = tk.Label(bot, text="  Apply  ", bg=ACCENT, fg=BG,
+                            font=("Courier New", 12, "bold"), cursor="hand2",
+                            padx=8, pady=6)
+        apply_lbl.bind("<Button-1>", lambda e: _apply())
+        apply_lbl.bind("<Enter>",    lambda e: apply_lbl.configure(bg="#2ea043"))
+        apply_lbl.bind("<Leave>",    lambda e: apply_lbl.configure(bg=ACCENT))
+        apply_lbl.pack(side="right")
+        save_lbl.bind("<Leave>",    lambda e: save_lbl.configure(bg=ACCENT))
+        save_lbl.pack(side="right", padx=(4,0))
+
+        # activate first tab
+        _switch("General")
     # ── Keybindings ───────────────────────────────────────────────────────────
     def _apply_keybindings(self):
         self.bind("<Control-s>",     lambda e:self.save_file())

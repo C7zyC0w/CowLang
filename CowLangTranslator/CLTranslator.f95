@@ -12,6 +12,7 @@ program CLtranslator
     integer, parameter :: MAXFBODY = 400
     integer, parameter :: MAXA     = 50
     integer, parameter :: MAXELEM  = 200
+    integer, parameter :: MAXEXT   = 64      ! max extern C functions
 
     logical, parameter :: DIRECT_PRINT = .false.
     logical, parameter :: TRACE        = .false.
@@ -80,6 +81,13 @@ program CLtranslator
     character(len=200) :: avals(MAXA, MAXELEM)
     integer            :: acount
 
+    ! ================= EXTERN C TABLE =================
+    character(len=64)  :: ext_name(MAXEXT)
+    character(len=16)  :: ext_rtype(MAXEXT)
+    integer            :: ext_nparams(MAXEXT)
+    character(len=16)  :: ext_ptypes(MAXEXT,8)
+    integer            :: ext_count
+
     ! ---- Prompts ----
     character(len=*), parameter :: PROMPT_MAIN = '>>> '
     character(len=*), parameter :: PROMPT_CONT = '... '
@@ -99,6 +107,7 @@ program CLtranslator
     has_return       = .false.
     return_value     = ''
     acount           = 0
+    ext_count        = 0
 
     ! ================= MAIN REPL LOOP =================
     do
@@ -618,6 +627,15 @@ recursive subroutine parse_line(cmd)
         end if
         call do_read(rest); return
     end if
+
+    ! ---- Extern declaration ----
+    if (starts_with_keyword(l,'extern')) then
+        rest = lstrip_ws(l(7:))
+        call do_extern_decl(rest); return
+    end if
+
+    ! ---- Extern statement-level call: funcname(...) ----
+    call try_extern_call_stmt(l)
 end subroutine
 
 subroutine execute_stmt_list(list)
@@ -1048,6 +1066,15 @@ recursive subroutine execute_block(body, count)
             call do_read(rest); j = j + 1; cycle
         end if
 
+        ! ---- extern declaration ----
+        if (starts_with_keyword(s,'extern')) then
+            rest = lstrip_ws(s(7:))
+            call do_extern_decl(rest); j = j + 1; cycle
+        end if
+
+        ! ---- extern statement-level call ----
+        call try_extern_call_stmt(s)
+
         j = j + 1
     end do
 end subroutine
@@ -1448,6 +1475,20 @@ subroutine handle_assignment(line)
     name = trim(lstrip_ws(line(:p-1)))
     expr = trim(lstrip_ws(line(p+1:)))
 
+    ! Extern function call on RHS: funcname(...)
+    if (index(expr,'(') > 0) then
+        block
+            integer :: eidx2
+            character(len=200) :: esval
+            eidx2 = find_extern_call(expr)
+            if (eidx2 > 0) then
+                call invoke_extern(eidx2, expr, esval)
+                call set_or_create_var(name, trim(ext_rtype(eidx2)), trim(esval))
+                return
+            end if
+        end block
+    end if
+
     ! String literal
     if (len_trim(expr) >= 1) then
         if (expr(1:1) == '"') then
@@ -1671,6 +1712,20 @@ function resolve_value(tok) result(res)
     res = ''
 
     if (len_trim(ttrim) == 0) return
+
+    ! Extern function call: funcname(...)
+    if (index(ttrim,'(') > 0) then
+        block
+            integer :: eidx3
+            character(len=200) :: eres
+            eidx3 = find_extern_call(ttrim)
+            if (eidx3 > 0) then
+                call invoke_extern(eidx3, ttrim, eres)
+                res = trim(eres)
+                return
+            end if
+        end block
+    end if
 
     ! String literal "..."
     if (len_trim(ttrim) >= 2) then
@@ -2079,38 +2134,25 @@ subroutine get_val_dp(expr, val, dp)
     integer, intent(out) :: dp
     integer :: idx
     character(len=200) :: rv
-
-    val = 0.0
-    dp = 0
-
+    val = 0.0; dp = 0
     idx = get_var_index(expr)
-
     if (idx > 0) then
         if (vtype(idx) == 'int') then
-            read(vval(idx),*,err=10,end=10) val
-            return
+            read(vval(idx),*,err=10,end=10) val; return
         else if (vtype(idx) == 'float') then
-            read(vval(idx),*,err=10,end=10) val
-            return
+            read(vval(idx),*,err=10,end=10) val; return
         else
             val = 0.0
         end if
     else
-        read(expr,*,err=10,end=10) val
-        return
+        read(expr,*,err=10,end=10) val; return
+10      ! Try resolve_value (func call, array elem, builtin)
+        rv = trim(resolve_value(expr))
+        if (trim(rv) /= trim(expr)) then
+            read(rv,*,err=20,end=20) val; return
+20          val = 0.0
+        end if
     end if
-
-10  continue   !Try resolve_value (func call, array elem, builtin)
-
-    rv = trim(resolve_value(expr))
-
-    if (trim(rv) /= trim(expr)) then
-        read(rv,*,err=20,end=20) val
-        return
-20      continue
-        val = 0.0
-    end if
-
 end subroutine
 
 ! ================= STRING EXPRESSION EVALUATOR =================
@@ -2285,6 +2327,292 @@ subroutine handle_end_prog(given_name)
     has_return       = .false.
     return_value     = ''
     acount           = 0
+    ext_count        = 0
+end subroutine
+
+! ================= EXTERN C SUPPORT =================
+! Syntax:
+!   extern void  :: funcname(int, float, str)
+!   extern int   :: funcname(int)
+!   result = funcname(arg1, arg2)
+!   funcname(arg1)
+!   print funcname(arg1)
+!
+! Supported param/return types: int, float, str, void
+! Uses dlopen/dlsym (POSIX) to find symbols in loaded libs.
+
+subroutine do_extern_decl(rest)
+    use iso_c_binding
+    character(len=*), intent(in) :: rest
+    character(len=300) :: r
+    character(len=16)  :: rtype
+    character(len=64)  :: fname
+    character(len=200) :: params_str
+    character(len=16)  :: ptypes(8)
+    integer :: nparams, dcolon, lparen, rparen, i, p, q
+    character(len=16) :: tok
+
+    r = trim(lstrip_ws(rest))
+    dcolon = index(r,'::')
+    if (dcolon <= 0) then
+        call push_line(outbuf, outcount, 'Error: extern syntax: extern type :: funcname(type,...)')
+        return
+    end if
+    rtype = to_lower(trim(lstrip_ws(r(:dcolon-1))))
+    r = trim(lstrip_ws(r(dcolon+2:)))
+    lparen = index(r,'(')
+    rparen = index(r,')')
+    if (lparen <= 0 .or. rparen <= lparen) then
+        call push_line(outbuf, outcount, 'Error: extern: expected funcname(...)')
+        return
+    end if
+    fname      = trim(r(:lparen-1))
+    params_str = trim(r(lparen+1:rparen-1))
+
+    nparams = 0
+    p = 1
+    do while (p <= len_trim(params_str))
+        q = index(params_str(p:), ',')
+        if (q > 0) then
+            tok = trim(lstrip_ws(params_str(p:p+q-2)))
+            p = p + q
+        else
+            tok = trim(lstrip_ws(params_str(p:)))
+            p = len_trim(params_str) + 1
+        end if
+        if (len_trim(tok) > 0) then
+            nparams = nparams + 1
+            if (nparams <= 8) ptypes(nparams) = to_lower(trim(tok))
+        end if
+    end do
+
+    if (ext_count >= MAXEXT) then
+        call push_line(outbuf, outcount, 'Error: extern table full'); return
+    end if
+    ext_count = ext_count + 1
+    ext_name(ext_count)    = trim(fname)
+    ext_rtype(ext_count)   = trim(rtype)
+    ext_nparams(ext_count) = nparams
+    do i = 1, nparams
+        ext_ptypes(ext_count,i) = ptypes(i)
+    end do
+end subroutine
+
+integer function find_extern_call(tok)
+    character(len=*), intent(in) :: tok
+    character(len=300) :: t
+    integer :: lp, i
+    find_extern_call = 0
+    t = trim(lstrip_ws(tok))
+    lp = index(t,'(')
+    if (lp <= 0) return
+    do i = 1, ext_count
+        if (to_lower(trim(t(:lp-1))) == to_lower(trim(ext_name(i)))) then
+            find_extern_call = i; return
+        end if
+    end do
+end function
+
+subroutine parse_call_args(tok, args, nargs)
+    character(len=*),   intent(in)  :: tok
+    character(len=200), intent(out) :: args(8)
+    integer,            intent(out) :: nargs
+    character(len=300) :: t, inner
+    integer :: lp, rp, p, q
+    character(len=200) :: piece
+
+    nargs = 0
+    t  = trim(lstrip_ws(tok))
+    lp = index(t,'(')
+    rp = index(t,')')
+    if (lp <= 0 .or. rp <= lp) return
+
+    inner = trim(t(lp+1:rp-1))
+    p = 1
+    do while (p <= len_trim(inner))
+        q = index(inner(p:),',')
+        if (q > 0) then
+            piece = trim(lstrip_ws(inner(p:p+q-2)))
+            p = p + q
+        else
+            piece = trim(lstrip_ws(inner(p:)))
+            p = len_trim(inner) + 1
+        end if
+        if (len_trim(piece) > 0) then
+            nargs = nargs + 1
+            if (nargs <= 8) args(nargs) = trim(resolve_value(piece))
+        end if
+    end do
+end subroutine
+
+subroutine invoke_extern(eidx, tok, result_str)
+    use iso_c_binding
+    integer,            intent(in)  :: eidx
+    character(len=*),   intent(in)  :: tok
+    character(len=200), intent(out) :: result_str
+
+    interface
+        function dlopen(filename, flag) bind(c, name='dlopen')
+            use iso_c_binding
+            type(c_ptr) :: dlopen
+            character(kind=c_char), intent(in) :: filename(*)
+            integer(c_int), value :: flag
+        end function
+        function dlsym(handle, symbol) bind(c, name='dlsym')
+            use iso_c_binding
+            type(c_funptr) :: dlsym
+            type(c_ptr), value :: handle
+            character(kind=c_char), intent(in) :: symbol(*)
+        end function
+        function dlclose(handle) bind(c, name='dlclose')
+            use iso_c_binding
+            integer(c_int) :: dlclose
+            type(c_ptr), value :: handle
+        end function
+    end interface
+
+    abstract interface
+        function fi_int_noarg() bind(c)
+            use iso_c_binding; integer(c_int) :: fi_int_noarg
+        end function
+        function fi_double_noarg() bind(c)
+            use iso_c_binding; real(c_double) :: fi_double_noarg
+        end function
+        function fi_int_i(a) bind(c)
+            use iso_c_binding; integer(c_int) :: fi_int_i
+            integer(c_int), value :: a
+        end function
+        function fi_double_d(a) bind(c)
+            use iso_c_binding; real(c_double) :: fi_double_d
+            real(c_double), value :: a
+        end function
+        function fi_int_ii(a,b) bind(c)
+            use iso_c_binding; integer(c_int) :: fi_int_ii
+            integer(c_int), value :: a, b
+        end function
+        function fi_double_dd(a,b) bind(c)
+            use iso_c_binding; real(c_double) :: fi_double_dd
+            real(c_double), value :: a, b
+        end function
+        subroutine fi_sub_void() bind(c)
+            use iso_c_binding
+        end subroutine
+        subroutine fi_sub_i(a) bind(c)
+            use iso_c_binding; integer(c_int), value :: a
+        end subroutine
+        subroutine fi_sub_s(a) bind(c)
+            use iso_c_binding
+            character(kind=c_char), intent(in) :: a(*)
+        end subroutine
+    end interface
+
+    procedure(fi_int_noarg),   pointer :: pfn_i0  => null()
+    procedure(fi_double_noarg),pointer :: pfn_d0  => null()
+    procedure(fi_int_i),       pointer :: pfn_i1  => null()
+    procedure(fi_double_d),    pointer :: pfn_d1  => null()
+    procedure(fi_int_ii),      pointer :: pfn_i2  => null()
+    procedure(fi_double_dd),   pointer :: pfn_d2  => null()
+    procedure(fi_sub_void),    pointer :: pfn_sv  => null()
+    procedure(fi_sub_i),       pointer :: pfn_si  => null()
+    procedure(fi_sub_s),       pointer :: pfn_ss  => null()
+
+    type(c_ptr)    :: lib_handle
+    type(c_funptr) :: fn_ptr
+    character(kind=c_char,len=256) :: c_fname, c_arg_str
+    integer(c_int) :: ival
+    real(c_double) :: dval
+    integer :: i, nargs, iarr(8)
+    real(c_double) :: darr(8)
+    character(len=200) :: args(8)
+    character(len=64)  :: fname_str
+
+    result_str = ''
+    fname_str  = trim(ext_name(eidx))
+    call parse_call_args(tok, args, nargs)
+
+    do i = 1, nargs
+        if (i <= 8) then
+            read(args(i),*,err=10,end=10) darr(i)
+            iarr(i) = nint(darr(i)); goto 11
+10          darr(i) = 0.0d0; iarr(i) = 0
+11          continue
+        end if
+    end do
+
+    c_fname    = trim(fname_str)//c_null_char
+    lib_handle = dlopen(c_null_char, 1)   ! RTLD_LAZY
+    fn_ptr     = dlsym(lib_handle, c_fname)
+
+    if (.not. c_associated(fn_ptr)) then
+        call push_line(outbuf, outcount, &
+            'Error: extern "'//trim(fname_str)//'" not found (not linked)')
+        return
+    end if
+
+    select case (trim(to_lower(ext_rtype(eidx))))
+
+    case ('int','integer')
+        select case (nargs)
+        case (0)
+            call c_f_procpointer(fn_ptr, pfn_i0); ival = pfn_i0()
+        case (1)
+            call c_f_procpointer(fn_ptr, pfn_i1); ival = pfn_i1(int(iarr(1),c_int))
+        case (2)
+            call c_f_procpointer(fn_ptr, pfn_i2)
+            ival = pfn_i2(int(iarr(1),c_int), int(iarr(2),c_int))
+        case default
+            call push_line(outbuf, outcount, &
+                'Error: extern int with '//trim(int2s(nargs))//' args not supported'); return
+        end select
+        write(result_str,'(I0)') ival
+
+    case ('float','double','real')
+        select case (nargs)
+        case (0)
+            call c_f_procpointer(fn_ptr, pfn_d0); dval = pfn_d0()
+        case (1)
+            call c_f_procpointer(fn_ptr, pfn_d1); dval = pfn_d1(darr(1))
+        case (2)
+            call c_f_procpointer(fn_ptr, pfn_d2); dval = pfn_d2(darr(1), darr(2))
+        case default
+            call push_line(outbuf, outcount, &
+                'Error: extern float with '//trim(int2s(nargs))//' args not supported'); return
+        end select
+        write(result_str,'(G0)') dval
+
+    case ('void','')
+        select case (nargs)
+        case (0)
+            call c_f_procpointer(fn_ptr, pfn_sv); call pfn_sv()
+        case (1)
+            if (trim(ext_ptypes(eidx,1)) == 'str') then
+                call c_f_procpointer(fn_ptr, pfn_ss)
+                c_arg_str = trim(args(1))//c_null_char
+                call pfn_ss(c_arg_str)
+            else
+                call c_f_procpointer(fn_ptr, pfn_si)
+                call pfn_si(int(iarr(1),c_int))
+            end if
+        case default
+            call push_line(outbuf, outcount, &
+                'Error: extern void with '//trim(int2s(nargs))//' args not supported'); return
+        end select
+        result_str = ''
+
+    case default
+        call push_line(outbuf, outcount, &
+            'Error: unsupported extern return type: '//trim(ext_rtype(eidx)))
+    end select
+
+    if (c_associated(lib_handle)) ival = dlclose(lib_handle)
+end subroutine
+
+subroutine try_extern_call_stmt(line)
+    character(len=*), intent(in) :: line
+    character(len=200) :: dummy
+    integer :: eidx
+    eidx = find_extern_call(line)
+    if (eidx > 0) call invoke_extern(eidx, line, dummy)
 end subroutine
 
 end program CLtranslator
