@@ -1,7 +1,0 @@
-#!/usr/bin/env xdg-open
-[Desktop Entry]
-Name=CLIDE
-Exec=CLIDE
-Icon=icon
-Type=Application
-Categories=Development;
